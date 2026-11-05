@@ -25,9 +25,7 @@ using Dalamud.Plugin.Services;
 
 namespace BryersHideoutGames.Browser;
 
-/// <summary>
 /// ImGui/IPC side only. CefSharp assemblies live exclusively in the external executable.
-/// </summary>
 public sealed class OffscreenBrowser : IDisposable
 {
     private readonly IPluginLog log;
@@ -51,8 +49,7 @@ public sealed class OffscreenBrowser : IDisposable
     private bool leftMouseHeld;
     private bool rightMouseHeld;
     private bool middleMouseHeld;
-    // The remote Chromium surface is deliberately smaller than the ImGui rectangle.
-    // This reduces expensive full-frame readback, IPC traffic, and GPU uploads.
+    // reduces expensive full-frame readback, IPC traffic, and GPU uploads.
     private int width = 1000;
     private int height = 739;
     private int resizeCandidateWidth = 1000;
@@ -87,7 +84,7 @@ public sealed class OffscreenBrowser : IDisposable
         this.renderScalePercent = Math.Clamp(renderScalePercent, 55, 100);
         if (compactMode)
         {
-            // Start Chromium at a narrow portrait viewport before the first
+            // Start Chromium at a portrait viewport before the first
             // UI draw. Responsive mobile CSS is active from the first load.
             width = resizeCandidateWidth = 430;
             height = resizeCandidateHeight = 755;
@@ -113,7 +110,7 @@ public sealed class OffscreenBrowser : IDisposable
             };
             psi.ArgumentList.Add(pipeId);
             psi.ArgumentList.Add(Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            psi.ArgumentList.Add(profile); // Access codes are sent over the private pipe, NEVER via command-line args.
+            psi.ArgumentList.Add(profile); // Access codes are sent over the private pipe
             helper = Process.Start(psi) ?? throw new InvalidOperationException("Could not launch external browser process.");
             log.Information("[BryerGames] Launched isolated Chromium helper for {Destination} (PID {ProcessId}).", destination, helper.Id);
 
@@ -138,7 +135,7 @@ public sealed class OffscreenBrowser : IDisposable
         catch (Exception ex)
         {
             // The helper can finish normally before the pipe reader observes EOF.
-            // Keep genuine crashes visible, but don't report an expected close as ERR.
+            // Keep genuine crashes visible
             var exitCode = -1;
             try
             {
