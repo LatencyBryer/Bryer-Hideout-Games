@@ -66,5 +66,35 @@ foreach ($name in @('BryersHideoutGamesHost.exe','libcef.dll','CefSharp.Core.Run
 if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
 Add-Type -AssemblyName System.IO.Compression
 [System.IO.Compression.ZipFile]::CreateFromDirectory($package, $zipPath, [IO.Compression.CompressionLevel]::Optimal, $false)
-Write-Host "Release asset ready: $zipPath" -ForegroundColor Green
-Write-Host "Included Chromium: $runtimeName" -ForegroundColor Green
+
+# Validate the final ARCHIVE, not only the staging directory. A source-only ZIP
+# is installable by Dalamud but cannot open any game without these files.
+$archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+try {
+    $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $archive.Entries) { [void]$names.Add($entry.FullName.Replace('\', '/')) }
+    $required = @(
+        'BryersHideoutGames.dll',
+        'BryersHideoutGames.json',
+        'BryersHideoutGames.deps.json',
+        '_browser-runtime-current.txt',
+        "$runtimeName/BryersHideoutGamesHost.exe",
+        "$runtimeName/BryersHideoutGamesHost.dll",
+        "$runtimeName/BryersHideoutGamesHost.runtimeconfig.json",
+        "$runtimeName/libcef.dll",
+        "$runtimeName/CefSharp.Core.Runtime.dll",
+        "$runtimeName/CefSharp.BrowserSubprocess.exe",
+        "$runtimeName/locales/en-US.pak"
+    )
+    foreach ($name in $required) {
+        if (!$names.Contains($name)) { throw "Release ZIP is incomplete; missing entry: $name" }
+    }
+    $markerEntry = $archive.GetEntry('_browser-runtime-current.txt')
+    $reader = [IO.StreamReader]::new($markerEntry.Open())
+    try { $markerValue = $reader.ReadToEnd().Trim() } finally { $reader.Dispose() }
+    if ($markerValue -cne $runtimeName) {
+        throw "Release marker does not match bundled Chromium runtime: $markerValue"
+    }
+} finally { $archive.Dispose() }
+Write-Host "Validated installable Dalamud Release: $zipPath" -ForegroundColor Green
+Write-Host "Bundled Chromium: $runtimeName" -ForegroundColor Green

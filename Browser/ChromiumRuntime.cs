@@ -34,38 +34,56 @@ public sealed class ChromiumRuntime
     public string ProfileRoot => Path.Combine(configDirectory, "ChromiumProfile");
     public string? Error { get; private set; }
 
-    private string InstallDirectory()
+    // Dalamud installs custom-repository packages under
+    // installedPlugins/<InternalName>/<AssemblyVersion>/. The marker and Chromium
+    // helper are distributed beside the plugin DLL, NOT in <InternalName>/.
+    // Development builds are the exception: an IDE may load the DLL from bin/.
+    private string RuntimeDirectory()
     {
-        var current = new DirectoryInfo(pluginDirectory);
-        for (var depth = 0; current != null && depth < 9; depth++, current = current.Parent)
-            if (current.Name.Equals("BryersHideoutGames", StringComparison.OrdinalIgnoreCase)) return current.FullName;
+        if (File.Exists(Path.Combine(pluginDirectory, "_browser-runtime-current.txt")))
+            return pluginDirectory;
+
+        var directory = new DirectoryInfo(pluginDirectory);
+        for (var depth = 0; directory != null && depth < 9; depth++, directory = directory.Parent)
+        {
+            if (directory.Name.Equals("BryersHideoutGames", StringComparison.OrdinalIgnoreCase)
+                && File.Exists(Path.Combine(directory.FullName, "Host", "BryersHideoutGamesHost.csproj")))
+                return directory.FullName;
+        }
+
+        // Do not search other installed plugin versions or silently use stale DLLs.
         return pluginDirectory;
     }
 
-    // The installer writes the exact immutable v13 runtime folder to this marker.
-    // Never fall back to a different protocol version: frame formats must match.
+    // The marker is shipped INSIDE the Dalamud release ZIP, together with the
+    // immutable v13 helper. Players never need the developer build script.
     private (string Path, string? Problem) ResolveHost()
     {
-        var root = InstallDirectory();
+        var root = RuntimeDirectory();
         var marker = Path.Combine(root, "_browser-runtime-current.txt");
+        const string installAdvice = "Update or reinstall Bryer's Hideout Games through Dalamud. "
+            + "If this persists, the GitHub Release package is missing its Chromium runtime.";
         if (!File.Exists(marker))
-            return (string.Empty, $"Chromium runtime marker is missing: {marker}. Run build-devplugin.ps1 without -SkipInstall.");
+            return (string.Empty, $"Chromium runtime marker is missing from this installation: {marker}. {installAdvice}");
 
         string directoryName;
         try { directoryName = File.ReadAllText(marker).Trim(); }
-        catch (IOException ex) { return (string.Empty, $"Could not read the Chromium runtime marker: {ex.GetType().Name}."); }
-        catch (UnauthorizedAccessException) { return (string.Empty, "Chromium runtime marker is not readable."); }
+        catch (IOException ex) { return (string.Empty, $"Could not read the Chromium runtime marker: {ex.GetType().Name}. {installAdvice}"); }
+        catch (UnauthorizedAccessException) { return (string.Empty, $"Chromium runtime marker is not readable. {installAdvice}"); }
 
         var expectedPrefix = $"_browser-runtime-v{RuntimeProtocolVersion}-";
         if (!Regex.IsMatch(directoryName, $"^{Regex.Escape(expectedPrefix)}[0-9a-fA-F]{{12}}$", RegexOptions.CultureInvariant))
-            return (string.Empty, $"Chromium runtime marker points to an incompatible or invalid version. Expected {expectedPrefix}<12-hex>, got '{directoryName}'. Run build-devplugin.ps1 again.");
+            return (string.Empty, $"The packaged Chromium runtime marker is invalid or incompatible (expected {expectedPrefix}<12-hex>). {installAdvice}");
 
         var runtimeDir = Path.Combine(root, directoryName);
         var executable = Path.Combine(runtimeDir, HostName);
         if (!File.Exists(executable))
-            return (executable, $"Chromium runtime v{RuntimeProtocolVersion} is not installed: {executable}. Run build-devplugin.ps1 without -SkipInstall.");
-        if (!File.Exists(Path.Combine(runtimeDir, "locales", "en-US.pak")))
-            return (executable, $"Chromium runtime is incomplete (locales/en-US.pak missing in {runtimeDir}). Run build-devplugin.ps1 to repair it.");
+            return (executable, $"Chromium runtime v{RuntimeProtocolVersion} is missing its host executable: {executable}. {installAdvice}");
+        if (!File.Exists(Path.Combine(runtimeDir, "libcef.dll"))
+            || !File.Exists(Path.Combine(runtimeDir, "CefSharp.Core.Runtime.dll"))
+            || !File.Exists(Path.Combine(runtimeDir, "CefSharp.BrowserSubprocess.exe"))
+            || !File.Exists(Path.Combine(runtimeDir, "locales", "en-US.pak")))
+            return (executable, $"The packaged Chromium runtime is incomplete: {runtimeDir}. {installAdvice}");
 
         return (executable, null);
     }

@@ -1,68 +1,125 @@
-# /* ████  ████  █   █ █████ ████  © */
-# /* █░░░█ █░░░█  █ █ ░█░░░░░█░░░█   */
-# /* ████░░████░░  █ ░ ████░░████░░  */
-# /* █░░░█ █░░█░ ░ █░ ░█░░░░ █░░█░ ░ */
-# /* ████░░█░░░█░  █░░ █████░█░░░█░  */
-# /* ░░░░ ░░░  ░   ░░  ░░░░░ ░░  ░   */
-# /* ░░░░  ░   ░   ░   ░░░░░ ░   ░   */
-
-name: Build and publish Bryer's Hideout Games
+name: Build and publish Dalamud release
 
 on:
   push:
-    tags:
-      - 'v[0-9]*.[0-9]*.[0-9]*'
+    branches: [main]
+    paths-ignore:
+      - repo.json
+      - "**/*.md"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: bryers-hideout-games-release
+  cancel-in-progress: false
+
 jobs:
   release:
+    if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up .NET 10
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Install .NET 10 SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
-      - name: Install Dalamud reference assemblies
+          dotnet-version: 10.0.x
+
+      - name: Prepare official Dalamud build references
         shell: pwsh
         run: |
-          $output = Join-Path $env:RUNNER_TEMP 'dalamud-latest.zip'
-          Invoke-WebRequest -Uri 'https://goatcorp.github.io/dalamud-distrib/latest.zip' -OutFile $output
-          $dir = Join-Path $env:APPDATA 'XIVLauncher\addon\Hooks\dev'
-          New-Item -Path $dir -ItemType Directory -Force | Out-Null
-          Expand-Archive -LiteralPath $output -DestinationPath $dir -Force
-      - name: Package DLL and isolated Chromium host
+          $ErrorActionPreference = 'Stop'
+          # Dalamud.NET.Sdk requires the local distribution DLLs at build time.
+          # The GitHub runner has no XIVLauncher installation.
+          $download = Join-Path $env:RUNNER_TEMP 'dalamud-distribution.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'dalamud-distribution'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/goatcorp/dalamud-distrib/main/latest.zip' -OutFile $download
+          Expand-Archive -LiteralPath $download -DestinationPath $destination -Force
+          $dll = Get-ChildItem -LiteralPath $destination -Filter 'Dalamud.dll' -Recurse -File | Select-Object -First 1
+          if ($null -eq $dll) { throw 'Dalamud.dll was not found in the official distribution.' }
+          $libDirectory = $dll.DirectoryName
+          foreach ($required in @('Dalamud.dll', 'Dalamud.Common.dll', 'Dalamud.Bindings.ImGui.dll')) {
+            if (!(Test-Path -LiteralPath (Join-Path $libDirectory $required))) {
+              throw "Missing required Dalamud build reference: $required"
+            }
+          }
+          "DALAMUD_HOME=$libDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Using official Dalamud references: $libDirectory"
+
+      - name: Build complete plugin and bundled Chromium
+        shell: pwsh
+        env:
+          RELEASE_VERSION: 1.1.${{ github.run_number }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/package-release.ps1 -Version $env:RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Release packaging failed.' }
+
+      - name: Verify Release ZIP contains its Chromium helper
         shell: pwsh
         run: |
-          $tag = '${{ github.ref_name }}'
-          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') { throw 'Use tags such as v1.0.0.' }
-          & .\scripts\package-release.ps1 -Version $Matches[1]
+          $ErrorActionPreference = 'Stop'
+          $path = Join-Path $PWD '_release/BryersHideoutGames-latest.zip'
+          if (!(Test-Path -LiteralPath $path)) { throw 'Release ZIP was not created.' }
+          Add-Type -AssemblyName System.IO.Compression
+          $zip = [IO.Compression.ZipFile]::OpenRead($path)
+          try {
+            $marker = $zip.GetEntry('_browser-runtime-current.txt')
+            if ($null -eq $marker) { throw 'Chromium marker missing from Release.' }
+            $reader = [IO.StreamReader]::new($marker.Open())
+            try { $runtime = $reader.ReadToEnd().Trim() } finally { $reader.Dispose() }
+            foreach ($name in @('BryersHideoutGames.dll', 'BryersHideoutGames.json',
+                 "$runtime/BryersHideoutGamesHost.exe", "$runtime/libcef.dll",
+                 "$runtime/CefSharp.Core.Runtime.dll", "$runtime/locales/en-US.pak")) {
+              if ($null -eq $zip.GetEntry($name)) { throw "Release ZIP missing $name" }
+            }
+            Write-Host "Valid release with browser runtime $runtime"
+          } finally { $zip.Dispose() }
+
       - name: Publish GitHub Release
         shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: 1.1.${{ github.run_number }}
         run: |
-          $tag = '${{ github.ref_name }}'
-          gh release create $tag .\_release\BryersHideoutGames-latest.zip --title "Bryer's Hideout Games $tag" --generate-notes --latest --verify-tag
-      - name: Update custom Dalamud repository metadata
+          $ErrorActionPreference = 'Stop'
+          $tag = "v$env:RELEASE_VERSION"
+          $asset = '_release/BryersHideoutGames-latest.zip'
+          $published = @(gh release list --repo $env:GITHUB_REPOSITORY --limit 1000 --json tagName | ConvertFrom-Json)
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot list GitHub Releases.' }
+          if (@($published | Where-Object { $_.tagName -eq $tag }).Count -gt 0) {
+            & gh release upload $tag $asset --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            & gh release create $tag $asset --target $env:GITHUB_SHA `
+              --title "Bryer's Hideout Games $tag" `
+              --notes 'Includes the Dalamud plugin and self-contained Chromium runtime files. No scripts are required for users.' `
+              --latest --repo $env:GITHUB_REPOSITORY
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to publish the Release package.' }
+
+      - name: Update custom repo manifest for Dalamud updates
         shell: pwsh
+        env:
+          RELEASE_VERSION: 1.1.${{ github.run_number }}
         run: |
-          $version = '${{ github.ref_name }}'.TrimStart('v') + '.0'
-          git fetch origin main
-          git checkout -B main origin/main
-          $path = 'repo.json'
-          $entries = @(Get-Content -LiteralPath $path -Raw | ConvertFrom-Json)
-          if ($entries.Count -ne 1 -or $entries[0].InternalName -ne 'BryersHideoutGames') { throw 'Unexpected repo.json layout.' }
-          $entries[0].AssemblyVersion = $version
-          $entries[0].LastUpdate = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-          ConvertTo-Json -InputObject $entries -Depth 20 | Set-Content -LiteralPath $path -Encoding utf8
+          $ErrorActionPreference = 'Stop'
+          $data = ConvertFrom-Json -InputObject (Get-Content -LiteralPath 'repo.json' -Raw) -NoEnumerate
+          if ($data.Count -ne 1) { throw 'Expected exactly one plugin in repo.json.' }
+          $data[0].AssemblyVersion = "$env:RELEASE_VERSION.0"
+          $data[0].LastUpdate = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          ConvertTo-Json -InputObject $data -Depth 30 | Set-Content -LiteralPath 'repo.json' -Encoding utf8
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add repo.json
           git diff --cached --quiet
           if ($LASTEXITCODE -ne 0) {
-            git commit -m "Update Dalamud repository to $version"
-            git push origin HEAD:main
+            git commit -m "Update Dalamud repo for v$env:RELEASE_VERSION [skip ci]"
+            git push origin "HEAD:main"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not push updated repo.json.' }
           }
