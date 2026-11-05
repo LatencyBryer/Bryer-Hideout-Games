@@ -1,0 +1,35 @@
+<!--
+/* ████  ████  █   █ █████ ████  © */
+/* █░░░█ █░░░█  █ █ ░█░░░░░█░░░█   */
+/* ████░░████░░  █ ░ ████░░████░░  */
+/* █░░░█ █░░█░ ░ █░ ░█░░░░ █░░█░ ░ */
+/* ████░░█░░░█░  █░░ █████░█░░░█░  */
+/* ░░░░ ░░░  ░   ░░  ░░░░░ ░░  ░   */
+/* ░░░░  ░   ░   ░   ░░░░░ ░   ░   */
+-->
+
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <Version>1.0.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Name>Bryer's Hideout Games</Name>
+    <Author>Latency Bryer</Author>
+    <Punchline>Launch Bryer's Hideout minigames inside FFXIV.</Punchline>
+    <Description>Minigame launcher for Bryer’s Hideout.</Description>
+    <Tags>bryer;hideout;games;minigames</Tags>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="Host/**/*.cs" />
+    
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
+    <None Include="Resources/minigame-icons.bgra" CopyToOutputDirectory="PreserveNewest" TargetPath="minigame-icons.bgra" />
+  </ItemGroup>
+</Project>

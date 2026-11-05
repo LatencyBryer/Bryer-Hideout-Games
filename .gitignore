@@ -1,0 +1,48 @@
+# Compiled Dalamud and Chromium outputs
+bin/
+obj/
+**/bin/
+**/obj/
+_build-*/
+_browser-runtime-*/
+_browser-runtime-current.txt
+_pending-*/
+*.dll
+*.exe
+*.pdb
+*.deps.json
+*.runtimeconfig.json
+*.cache
+*.binlog
+
+# Chromium binaries only belong inside a GitHub Release package
+*.pak
+*.dat
+*.so
+*.dylib
+*.bin
+!Resources/minigame-icons.bgra
+chrome_elf.dll
+icudtl.dat
+libcef.dll
+locales/
+
+# Local application state and diagnostics
+ChromiumProfile/
+pluginConfigs/
+**/browser-helper.log
+*.log
+*.tmp
+.env
+.env.*
+!.env.example
+*.user
+*.suo
+.vs/
+.idea/
+.vscode/
+*.zip
+
+# Generated release artefacts
+_release/
+release/

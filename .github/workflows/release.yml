@@ -1,0 +1,68 @@
+# /* ████  ████  █   █ █████ ████  © */
+# /* █░░░█ █░░░█  █ █ ░█░░░░░█░░░█   */
+# /* ████░░████░░  █ ░ ████░░████░░  */
+# /* █░░░█ █░░█░ ░ █░ ░█░░░░ █░░█░ ░ */
+# /* ████░░█░░░█░  █░░ █████░█░░░█░  */
+# /* ░░░░ ░░░  ░   ░░  ░░░░░ ░░  ░   */
+# /* ░░░░  ░   ░   ░   ░░░░░ ░   ░   */
+
+name: Build and publish Bryer's Hideout Games
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Install Dalamud reference assemblies
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP 'dalamud-latest.zip'
+          Invoke-WebRequest -Uri 'https://goatcorp.github.io/dalamud-distrib/latest.zip' -OutFile $output
+          $dir = Join-Path $env:APPDATA 'XIVLauncher\addon\Hooks\dev'
+          New-Item -Path $dir -ItemType Directory -Force | Out-Null
+          Expand-Archive -LiteralPath $output -DestinationPath $dir -Force
+      - name: Package DLL and isolated Chromium host
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') { throw 'Use tags such as v1.0.0.' }
+          & .\scripts\package-release.ps1 -Version $Matches[1]
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          gh release create $tag .\_release\BryersHideoutGames-latest.zip --title "Bryer's Hideout Games $tag" --generate-notes --latest --verify-tag
+      - name: Update custom Dalamud repository metadata
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'.TrimStart('v') + '.0'
+          git fetch origin main
+          git checkout -B main origin/main
+          $path = 'repo.json'
+          $entries = @(Get-Content -LiteralPath $path -Raw | ConvertFrom-Json)
+          if ($entries.Count -ne 1 -or $entries[0].InternalName -ne 'BryersHideoutGames') { throw 'Unexpected repo.json layout.' }
+          $entries[0].AssemblyVersion = $version
+          $entries[0].LastUpdate = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          ConvertTo-Json -InputObject $entries -Depth 20 | Set-Content -LiteralPath $path -Encoding utf8
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add repo.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Update Dalamud repository to $version"
+            git push origin HEAD:main
+          }
