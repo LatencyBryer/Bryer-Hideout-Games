@@ -9,7 +9,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/LatencyBryer/Bryer-Hideout-Games/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/LatencyBryer/Bryer-Hideout-Games?label=latest%20release" /></a>
   <img alt="Dalamud API" src="https://img.shields.io/badge/Dalamud-API%2015-green" />
   <img alt=".NET" src="https://img.shields.io/badge/.NET-10-purple" />
   <img alt="Platform" src="https://img.shields.io/badge/Windows-x64-blue" />
