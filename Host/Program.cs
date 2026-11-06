@@ -124,12 +124,6 @@ internal sealed class BrowserHost : IDisposable
         // blocklist or disabling its software fallback. Offscreen output still
         // needs a CPU BGRA readback for our existing Dalamud texture pipeline.
         cef.CefCommandLineArgs.Add("enable-gpu-rasterization");
-        // This is a dedicated, windowless browser hosted by a separate process.
-        // Chromium may throttle requestAnimationFrame/timers when the user Alt+Tabs
-        // away from FFXIV, and the throttling sometimes persists on return.
-        // Keep the renderer responsive without disabling GPU safety protections.
-        cef.CefCommandLineArgs.Add("disable-background-timer-throttling");
-        cef.CefCommandLineArgs.Add("disable-renderer-backgrounding");
         cef.EnableAudio();
         var locales = Path.Combine(baseDirectory, "locales");
         if (Directory.Exists(locales)) cef.LocalesDirPath = locales;
@@ -389,16 +383,6 @@ internal sealed class BrowserHost : IDisposable
                             Volatile.Write(ref browserFocused, focus ? 1 : 0);
                             if (!focus) pressedMouseFlags = CefEventFlags.None;
                             control.SendFocusEvent(focus);
-                            break;
-                        case "resume":
-                            // Game regained OS foreground after Alt+Tab. Restore the
-                            // offscreen view and request a new frame without touching
-                            // game state, reloading the page, or stealing keyboard focus.
-                            control.WasHidden(false);
-                            control.Invalidate(PaintElementType.View);
-                            Interlocked.Exchange(ref dirty, 1);
-                            WakeFramePublisher();
-                            LogDiagnostic("FFXIV foreground resumed; offscreen paint refreshed.");
                             break;
                         case "wheel": control.SendMouseWheelEvent(evt, GetInt(root, "horizontal"), GetInt(root, "vertical")); break;
                         case "click":

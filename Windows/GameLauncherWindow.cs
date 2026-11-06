@@ -237,12 +237,28 @@ public sealed class GameLauncherWindow : Window, IDisposable
             plugin.Configuration.Save();
         }
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Browser render quality (55–100%). Higher values look sharper but may cost more FPS. Applies when reopening a game.");
-        ImGui.PopStyleColor(3);
 
-        // Compact mode = browser mobile mode
+        // Keep the FFXIV FPS slider directly aligned with the Screen dropdown:
+        // identical control left edge and width, with labels sharing one column.
         const float screenLabelX = 28f;
         const float screenComboX = 88f;
         const float screenComboWidth = 108f;
+        const string ffxivLabel = "FFXIV FPS";
+        var labelWidth = ImGui.CalcTextSize(ffxivLabel).X;
+        var ffxivLabelX = Math.Min(screenLabelX, screenComboX - labelWidth - 6f);
+        draw.AddText(new Vector2(origin.X + ffxivLabelX, fpsY + (sliderHeight - textHeight) * .5f), Muted, ffxivLabel);
+        var ffxivFps = Math.Clamp(plugin.Configuration.FfxivFpsLimit, 30, 60);
+        var ffxivSliderWidth = Math.Clamp(start.X - origin.X - screenComboX - 10f, 48f, screenComboWidth);
+        ImGui.SetCursorScreenPos(new Vector2(origin.X + screenComboX, fpsY));
+        ImGui.SetNextItemWidth(ffxivSliderWidth);
+        if (ImGui.SliderInt("##bryergames-ffxiv-fps", ref ffxivFps, 30, 60))
+            plugin.SetFfxivFpsLimit(ffxivFps);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Limit FFXIV FPS while a minigame is open\nto improve performance.");
+
+        ImGui.PopStyleColor(3);
+
+        // Compact mode = browser mobile mode
         var screenY = qualityY;
         draw.AddText(new Vector2(origin.X + screenLabelX,
             screenY + (sliderHeight - textHeight) * .5f), Muted, "Screen");

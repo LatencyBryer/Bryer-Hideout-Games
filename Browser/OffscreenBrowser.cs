@@ -34,8 +34,6 @@ public sealed class OffscreenBrowser : IDisposable
     private readonly IPluginLog log;
     private readonly int fpsLimit;
     private readonly int renderScalePercent;
-    private readonly string gameTag;
-    private int foregroundRestores;
     private readonly ITextureProvider textureProvider;
     private readonly string profileId;
     private readonly Channel<string> commands = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true });
@@ -103,7 +101,6 @@ public sealed class OffscreenBrowser : IDisposable
         if (profileId.Length != 32 || !System.Text.RegularExpressions.Regex.IsMatch(profileId, "^[0-9a-fA-F]{32}$"))
             throw new InvalidOperationException("Account browser profile was not initialized.");
         this.profileId = profileId;
-        gameTag = destination.ToString();
         telemetryFilePath = Path.Combine(runtime.ProfileRoot, "Games", profileId, "plugin-frame-pipeline.log");
         targetUrl = url;
         this.log = log;
@@ -124,9 +121,6 @@ public sealed class OffscreenBrowser : IDisposable
     private async Task RunAsync(SiteDestination destination, ChromiumRuntime runtime)
     {
         var token = stopping.Token;
-        // Foreground monitoring must run independently of ImGui.Draw: while
-        // FFXIV is minimized the Draw callback may stop completely.
-        using var foregroundMonitoring = CancellationTokenSource.CreateLinkedTokenSource(token);
         var normalHelperExit = false;
         try
         {
@@ -151,7 +145,6 @@ public sealed class OffscreenBrowser : IDisposable
             framePipe = new NamedPipeClientStream(".", pipeId + "-frames", PipeDirection.In, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
             await Task.WhenAll(commandPipe.ConnectAsync(timeout.Token), framePipe.ConnectAsync(timeout.Token));
             connected = true;
-            _ = TrackGameForegroundAsync(foregroundMonitoring.Token);
             commands.Writer.TryWrite(JsonSerializer.Serialize(new { type = "open", url = Volatile.Read(ref targetUrl).AbsoluteUri, fps = fpsLimit }));
             commands.Writer.TryWrite(JsonSerializer.Serialize(new { type = "resize", width, height }));
             var writer = SendCommandsAsync(commandPipe, token);
@@ -198,7 +191,6 @@ public sealed class OffscreenBrowser : IDisposable
         }
         finally
         {
-            foregroundMonitoring.Cancel();
             connected = false;
             commands.Writer.TryComplete();
             if (!disposed && !token.IsCancellationRequested && !normalHelperExit)
@@ -209,39 +201,6 @@ public sealed class OffscreenBrowser : IDisposable
                 stopping.Cancel();
                 try { if (helper is { HasExited: false }) helper.Kill(entireProcessTree: true); } catch { }
             }
-        }
-    }
-
-    // Observe the OS window rather than relying on ImGui focus events. The
-    // FFXIV drawing loop can pause entirely while the game is minimized.
-    private async Task TrackGameForegroundAsync(CancellationToken token)
-    {
-        bool? wasForeground = null;
-        try
-        {
-            while (!token.IsCancellationRequested && !disposed)
-            {
-                var window = Native.GetForegroundWindow();
-                if (window != IntPtr.Zero)
-                {
-                    Native.GetWindowThreadProcessId(window, out var processId);
-                    var isForeground = processId == (uint)Environment.ProcessId;
-                    if (isForeground && wasForeground == false)
-                    {
-                        Send(new { type = "resume" });
-                        Interlocked.Increment(ref foregroundRestores);
-                    }
-                    wasForeground = isForeground;
-                }
-                await Task.Delay(250, token);
-            }
-        }
-        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
-        catch (Exception ex)
-        {
-            // Monitoring is best effort. A foreground detection failure must
-            // never disconnect the browser or interrupt an active minigame.
-            log.Warning("[BryerGames] Foreground monitor stopped ({Type}).", ex.GetType().Name);
         }
     }
 
@@ -617,7 +576,7 @@ public sealed class OffscreenBrowser : IDisposable
         var pendingMs = pendingUpload != null && pendingUploadStarted != 0 ?
             Stopwatch.GetElapsedTime(pendingUploadStarted, now).TotalMilliseconds : 0;
         var mode = legacyTextureUploads ? "legacy-create-per-frame" : "dynamic-d3d11-pingpong";
-        var line = $"{DateTimeOffset.UtcNow:O} Frame pipeline 15s: game={gameTag}, foregroundRestores={Volatile.Read(ref foregroundRestores)}, renderer={mode}, gpuMapSkipped={Volatile.Read(ref gpuMapSkipped)}, drawFps={(draws - previousDrawCount) / seconds:F1}, receivedFps={(received - previousReceivedCount) / seconds:F1}, uploadedFps={(uploaded - previousUploadedCount) / seconds:F1}, replacedFps={(replaced - previousReplacedCount) / seconds:F1}, uploadAvgMs={avgMs:F1}, pendingUploadMs={pendingMs:F0}, resolution={width}x{height}.";
+        var line = $"{DateTimeOffset.UtcNow:O} Frame pipeline 15s: renderer={mode}, gpuMapSkipped={Volatile.Read(ref gpuMapSkipped)}, drawFps={(draws - previousDrawCount) / seconds:F1}, receivedFps={(received - previousReceivedCount) / seconds:F1}, uploadedFps={(uploaded - previousUploadedCount) / seconds:F1}, replacedFps={(replaced - previousReplacedCount) / seconds:F1}, uploadAvgMs={avgMs:F1}, pendingUploadMs={pendingMs:F0}, resolution={width}x{height}.";
         previousDrawCount = draws;
         previousReceivedCount = received;
         previousUploadedCount = uploaded;
@@ -796,8 +755,6 @@ public sealed class OffscreenBrowser : IDisposable
 
     private static class Native
     {
-        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
         [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int virtualKey);
         [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool GetKeyboardState([Out] byte[] keys);
         [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint virtualKey, uint mapType);

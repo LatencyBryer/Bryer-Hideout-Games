@@ -20,8 +20,10 @@ public enum BrowserScreenMode
 [Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 6;
+    public int Version { get; set; } = 7;
     public int BrowserFpsLimit { get; set; } = 60;
+    // Limits FFXIV itself only while a Bryer minigame is open and FFXIV is foreground.
+    public int FfxivFpsLimit { get; set; } = 60;
     public int RenderScalePercent { get; set; } = 100;
     public BrowserScreenMode ScreenMode { get; set; } = BrowserScreenMode.Compact;
     // Each screen mode keeps its own last used browser window size.

@@ -1,5 +1,5 @@
 <h1 align="center">
-  <strong>[W.I.P] *Not recommended to use yet</strong>
+  <strong>[W.I.P]</strong>
 </h1>
 
 <p align="center">

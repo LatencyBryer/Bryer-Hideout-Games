@@ -8,6 +8,9 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
 using BryersHideoutGames.Browser;
 using BryersHideoutGames.Security;
 using BryersHideoutGames.Services;
@@ -26,12 +29,17 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
     [PluginService] internal static IPluginLog PluginLog { get; private set; } = null!;
     [PluginService] internal static ITextureProvider TextureService { get; private set; } = null!;
+    [PluginService] internal static IFramework Framework { get; private set; } = null!;
 
     private readonly WindowSystem windows = new("BryersHideoutGames");
     private readonly GameLauncherWindow launcher;
     private readonly BrowserWindow browser;
     private readonly List<string> registeredCommands = [];
     private DateTime lastDrawErrorUtc = DateTime.MinValue;
+    // FFXIV FPS budget while a minigame is visible and the game has foreground focus.
+    // Defaults to 60 FPS and follows the saved launcher slider setting.
+    private int gameFpsBudget;
+    private long lastBudgetTick;
     private bool disposed;
 
     public Configuration Configuration { get; }
@@ -57,6 +65,20 @@ public sealed class Plugin : IDalamudPlugin
             Configuration.Version = 6;
             Configuration.Save();
         }
+        // Add the FFXIV FPS setting without changing any existing browser FPS / quality choices.
+        if (Configuration.Version < 7)
+        {
+            Configuration.FfxivFpsLimit = 60;
+            Configuration.Version = 7;
+            Configuration.Save();
+        }
+        var savedGameLimit = Math.Clamp(Configuration.FfxivFpsLimit, 30, 60);
+        if (Configuration.FfxivFpsLimit != savedGameLimit)
+        {
+            Configuration.FfxivFpsLimit = savedGameLimit;
+            Configuration.Save();
+        }
+        gameFpsBudget = savedGameLimit;
         var moduleDir = PluginInterface.AssemblyLocation.DirectoryName
             ?? throw new InvalidOperationException("Dalamud did not provide the plugin install directory.");
         if (moduleDir.Contains("\\bin\\", StringComparison.OrdinalIgnoreCase))
@@ -79,10 +101,12 @@ public sealed class Plugin : IDalamudPlugin
         RegisterAction("/blackprism", () => OpenGame(SiteDestination.BlackPrism), "Open Black Prism.");
         RegisterAction("/whisperinglibrary", () => OpenGame(SiteDestination.Library), "Open Whispering Library.");
 
+        Framework.Update += OnFrameworkUpdate;
+
         PluginInterface.UiBuilder.Draw += DrawSafely;
         PluginInterface.UiBuilder.OpenMainUi += OpenLauncher;
         PluginInterface.UiBuilder.OpenConfigUi += OpenLauncher;
-        PluginLog.Information("[BryerGames] v{Version} loaded (IPC v13) from {Directory}. Commands registered {Count}/8: {Names}",
+        PluginLog.Information("[BryerGames] v{Version} loaded (IPC v13) from {Directory}. Commands registered {Count}: {Names}",
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown", moduleDir,
             registeredCommands.Count, string.Join(", ", registeredCommands));
     }
@@ -138,6 +162,58 @@ public sealed class Plugin : IDalamudPlugin
         catch (Exception ex) { PluginLog.Warning(ex, "[BryerGames] Could not register {Command}.", name); }
     }
 
+    // Apply launcher slider changes immediately and persist for the next session.
+    // The FPS limit is controlled exclusively by the saved launcher slider.
+    public void SetFfxivFpsLimit(int requested)
+    {
+        var limit = Math.Clamp(requested, 30, 60);
+        if (Configuration.FfxivFpsLimit != limit)
+        {
+            Configuration.FfxivFpsLimit = limit;
+            Configuration.Save();
+        }
+        gameFpsBudget = limit;
+        lastBudgetTick = 0;
+    }
+
+    private void OnFrameworkUpdate(IFramework _)
+    {
+        var limit = gameFpsBudget;
+        if (disposed || limit == 0 || !browser.IsOpen || !IsThisGameForeground())
+        {
+            lastBudgetTick = 0;
+            return;
+        }
+        var now = Stopwatch.GetTimestamp();
+        var previous = lastBudgetTick;
+        if (previous != 0)
+        {
+            var remaining = (double)Stopwatch.Frequency / limit - (now - previous);
+            if (remaining > Stopwatch.Frequency * 0.0015)
+            {
+                // Coarse sleep only. Never spin-wait on the FFXIV framework thread.
+                // Limit the maximum delay to prevent long stalls after Alt+Tab.
+                var milliseconds = Math.Min(20, (int)Math.Floor(remaining * 1000d / Stopwatch.Frequency - 0.5));
+                if (milliseconds > 0) Thread.Sleep(milliseconds);
+            }
+        }
+        lastBudgetTick = Stopwatch.GetTimestamp();
+    }
+
+    private static bool IsThisGameForeground()
+    {
+        var hwnd = GetForegroundWindow();
+        if (hwnd == IntPtr.Zero) return false;
+        _ = GetWindowThreadProcessId(hwnd, out var pid);
+        return pid == (uint)Environment.ProcessId;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
     private void DrawSafely()
     {
         try
@@ -157,6 +233,9 @@ public sealed class Plugin : IDalamudPlugin
     {
         if (disposed) return;
         disposed = true;
+        Framework.Update -= OnFrameworkUpdate;
+        gameFpsBudget = 0;
+        lastBudgetTick = 0;
         PluginInterface.UiBuilder.Draw -= DrawSafely;
         PluginInterface.UiBuilder.OpenMainUi -= OpenLauncher;
         PluginInterface.UiBuilder.OpenConfigUi -= OpenLauncher;
