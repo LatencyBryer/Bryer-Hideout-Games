@@ -23,6 +23,7 @@ public sealed class ChromiumRuntime
     private readonly string pluginDirectory;
     private readonly string configDirectory;
     private bool missingHostLogged;
+    private bool resolutionLogged;
 
     public ChromiumRuntime(IPluginLog log, string pluginDirectory, string configDirectory)
     {
@@ -34,56 +35,63 @@ public sealed class ChromiumRuntime
     public string ProfileRoot => Path.Combine(configDirectory, "ChromiumProfile");
     public string? Error { get; private set; }
 
-    // Dalamud installs custom-repository packages under
-    // installedPlugins/<InternalName>/<AssemblyVersion>/. The marker and Chromium
-    // helper are distributed beside the plugin DLL, NOT in <InternalName>/.
-    // Development builds are the exception: an IDE may load the DLL from bin/.
-    private string RuntimeDirectory()
+    // An installed Dalamud plugin may run from .../BryersHideoutGames/1.0.0.X/.
+    // The runtime bundled with that DLL must take priority. The previous
+    // resolver climbed straight to the BryersHideoutGames parent directory,
+    // potentially launching a helper from an earlier installation instead.
+    private string? FindLegacyRoot()
     {
-        if (File.Exists(Path.Combine(pluginDirectory, "_browser-runtime-current.txt")))
-            return pluginDirectory;
-
-        var directory = new DirectoryInfo(pluginDirectory);
-        for (var depth = 0; directory != null && depth < 9; depth++, directory = directory.Parent)
-        {
-            if (directory.Name.Equals("BryersHideoutGames", StringComparison.OrdinalIgnoreCase)
-                && File.Exists(Path.Combine(directory.FullName, "Host", "BryersHideoutGamesHost.csproj")))
-                return directory.FullName;
-        }
-
-        // Do not search other installed plugin versions or silently use stale DLLs.
-        return pluginDirectory;
+        var current = new DirectoryInfo(pluginDirectory);
+        for (var depth = 0; current != null && depth < 9; depth++, current = current.Parent)
+            if (current.Name.Equals("BryersHideoutGames", StringComparison.OrdinalIgnoreCase))
+                return current.FullName;
+        return null;
     }
 
-    // The marker is shipped INSIDE the Dalamud release ZIP, together with the
-    // immutable v13 helper. Players never need the developer build script.
     private (string Path, string? Problem) ResolveHost()
     {
-        var root = RuntimeDirectory();
+        var root = pluginDirectory;
         var marker = Path.Combine(root, "_browser-runtime-current.txt");
-        const string installAdvice = "Update or reinstall Bryer's Hideout Games through Dalamud. "
-            + "If this persists, the GitHub Release package is missing its Chromium runtime.";
         if (!File.Exists(marker))
-            return (string.Empty, $"Chromium runtime marker is missing from this installation: {marker}. {installAdvice}");
+        {
+            // Never silently load the old root-level Chromium if a versioned
+            // plugin DLL is present here: otherwise new plugin code can run
+            // with an old helper and misleading performance diagnostics.
+            var directoryName = Path.GetFileName(Path.TrimEndingDirectorySeparator(pluginDirectory));
+            if (Regex.IsMatch(directoryName, @"^\d+\.\d+\.\d+(?:\.\d+)?$", RegexOptions.CultureInvariant) &&
+                File.Exists(Path.Combine(pluginDirectory, "BryersHideoutGames.dll")))
+            {
+                return (string.Empty, $"The Chromium runtime is missing beside the installed plugin DLL: {marker}. Reinstall the full GitHub Release ZIP (including the _browser-runtime-* directory), not the source-code ZIP.");
+            }
 
-        string directoryName;
-        try { directoryName = File.ReadAllText(marker).Trim(); }
-        catch (IOException ex) { return (string.Empty, $"Could not read the Chromium runtime marker: {ex.GetType().Name}. {installAdvice}"); }
-        catch (UnauthorizedAccessException) { return (string.Empty, $"Chromium runtime marker is not readable. {installAdvice}"); }
+            // Compatibility for older development layouts where the loader
+            // lives in a child directory and the assets live in the root.
+            var legacyRoot = FindLegacyRoot();
+            if (legacyRoot != null)
+            {
+                root = legacyRoot;
+                marker = Path.Combine(root, "_browser-runtime-current.txt");
+            }
+        }
+
+        if (!File.Exists(marker))
+            return (string.Empty, $"Chromium runtime marker is missing: {marker}. Build and install the complete release package.");
+
+        string runtimeName;
+        try { runtimeName = File.ReadAllText(marker).Trim(); }
+        catch (IOException ex) { return (string.Empty, $"Could not read the Chromium runtime marker: {ex.GetType().Name}."); }
+        catch (UnauthorizedAccessException) { return (string.Empty, "Chromium runtime marker is not readable."); }
 
         var expectedPrefix = $"_browser-runtime-v{RuntimeProtocolVersion}-";
-        if (!Regex.IsMatch(directoryName, $"^{Regex.Escape(expectedPrefix)}[0-9a-fA-F]{{12}}$", RegexOptions.CultureInvariant))
-            return (string.Empty, $"The packaged Chromium runtime marker is invalid or incompatible (expected {expectedPrefix}<12-hex>). {installAdvice}");
+        if (!Regex.IsMatch(runtimeName, $"^{Regex.Escape(expectedPrefix)}[0-9a-fA-F]{{12}}$", RegexOptions.CultureInvariant))
+            return (string.Empty, $"Chromium runtime marker points to an incompatible version: {runtimeName}. Reinstall the full Release ZIP.");
 
-        var runtimeDir = Path.Combine(root, directoryName);
+        var runtimeDir = Path.Combine(root, runtimeName);
         var executable = Path.Combine(runtimeDir, HostName);
         if (!File.Exists(executable))
-            return (executable, $"Chromium runtime v{RuntimeProtocolVersion} is missing its host executable: {executable}. {installAdvice}");
-        if (!File.Exists(Path.Combine(runtimeDir, "libcef.dll"))
-            || !File.Exists(Path.Combine(runtimeDir, "CefSharp.Core.Runtime.dll"))
-            || !File.Exists(Path.Combine(runtimeDir, "CefSharp.BrowserSubprocess.exe"))
-            || !File.Exists(Path.Combine(runtimeDir, "locales", "en-US.pak")))
-            return (executable, $"The packaged Chromium runtime is incomplete: {runtimeDir}. {installAdvice}");
+            return (executable, $"Chromium host is missing: {executable}. Reinstall the full Release ZIP.");
+        if (!File.Exists(Path.Combine(runtimeDir, "locales", "en-US.pak")))
+            return (executable, $"Chromium runtime is incomplete (locales/en-US.pak missing in {runtimeDir}).");
 
         return (executable, null);
     }
@@ -107,6 +115,21 @@ public sealed class ChromiumRuntime
         }
         Error = null;
         missingHostLogged = false;
+        if (!resolutionLogged)
+        {
+            resolutionLogged = true;
+            // Record selection where the existing browser diagnostics are kept,
+            // since /xllog can filter informational messages.
+            try
+            {
+                Directory.CreateDirectory(ProfileRoot);
+                File.AppendAllText(Path.Combine(ProfileRoot, "runtime-selection.log"),
+                    $"{DateTimeOffset.UtcNow:O} PluginDirectory={pluginDirectory} HostExecutable={file}{Environment.NewLine}");
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            log.Information("[BryerGames] Chromium runtime selected: {Executable}", file);
+        }
         return true;
     }
 

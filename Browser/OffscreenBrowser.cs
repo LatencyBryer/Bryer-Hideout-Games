@@ -7,6 +7,7 @@
 /* ░░░░  ░   ░   ░   ░░░░░ ░   ░   */
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -33,6 +34,8 @@ public sealed class OffscreenBrowser : IDisposable
     private readonly IPluginLog log;
     private readonly int fpsLimit;
     private readonly int renderScalePercent;
+    private readonly string gameTag;
+    private int foregroundRestores;
     private readonly ITextureProvider textureProvider;
     private readonly string profileId;
     private readonly Channel<string> commands = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true });
@@ -42,7 +45,14 @@ public sealed class OffscreenBrowser : IDisposable
     private NamedPipeClientStream? commandPipe;
     private NamedPipeClientStream? framePipe;
     private IDalamudTextureWrap? texture;
+    // The normal renderer uses two persistent, CPU-writable D3D11 textures.
+    // Legacy per-frame creation remains an emergency fallback for incompatible GPUs.
+    private PersistentGpuTextures? gpuSurfaces;
+    private bool legacyTextureUploads;
+    private int gpuMapSkipped;
     private Task<IDalamudTextureWrap>? pendingUpload;
+    // Keep rented pixels alive until CreateFromRawAsync has finished consuming them.
+    private Frame? uploadingFrame;
     private Frame? latest;
     private volatile bool connected;
     private volatile bool disposed;
@@ -66,13 +76,24 @@ public sealed class OffscreenBrowser : IDisposable
     private string status = "Launching browser helper...";
     private int receivedFrames;
     private int uploadedFrames;
+    // Replaced frames were received successfully but deliberately not uploaded:
+    // a real-time animation should display the newest frame, never build a queue.
+    private int replacedBeforeUpload;
     private long pendingUploadStarted;
     private int pendingUploadWidth;
     private int pendingUploadHeight;
     private long lastUploadWarning;
     private long lastHealthReport;
-    private long totalUploadMilliseconds;
+    private long totalUploadMicroseconds;
     private long completedUploadSamples;
+    private readonly string telemetryFilePath;
+    private int drawCount;
+    private int previousDrawCount;
+    private int previousReceivedCount;
+    private int previousUploadedCount;
+    private int previousReplacedCount;
+    private long previousUploadSamples;
+    private long previousUploadMicroseconds;
     private Uri targetUrl;
 
     private sealed record Frame(int Width, int Height, byte[] Pixels);
@@ -82,6 +103,8 @@ public sealed class OffscreenBrowser : IDisposable
         if (profileId.Length != 32 || !System.Text.RegularExpressions.Regex.IsMatch(profileId, "^[0-9a-fA-F]{32}$"))
             throw new InvalidOperationException("Account browser profile was not initialized.");
         this.profileId = profileId;
+        gameTag = destination.ToString();
+        telemetryFilePath = Path.Combine(runtime.ProfileRoot, "Games", profileId, "plugin-frame-pipeline.log");
         targetUrl = url;
         this.log = log;
         this.textureProvider = textureProvider;
@@ -101,6 +124,9 @@ public sealed class OffscreenBrowser : IDisposable
     private async Task RunAsync(SiteDestination destination, ChromiumRuntime runtime)
     {
         var token = stopping.Token;
+        // Foreground monitoring must run independently of ImGui.Draw: while
+        // FFXIV is minimized the Draw callback may stop completely.
+        using var foregroundMonitoring = CancellationTokenSource.CreateLinkedTokenSource(token);
         var normalHelperExit = false;
         try
         {
@@ -125,6 +151,7 @@ public sealed class OffscreenBrowser : IDisposable
             framePipe = new NamedPipeClientStream(".", pipeId + "-frames", PipeDirection.In, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
             await Task.WhenAll(commandPipe.ConnectAsync(timeout.Token), framePipe.ConnectAsync(timeout.Token));
             connected = true;
+            _ = TrackGameForegroundAsync(foregroundMonitoring.Token);
             commands.Writer.TryWrite(JsonSerializer.Serialize(new { type = "open", url = Volatile.Read(ref targetUrl).AbsoluteUri, fps = fpsLimit }));
             commands.Writer.TryWrite(JsonSerializer.Serialize(new { type = "resize", width, height }));
             var writer = SendCommandsAsync(commandPipe, token);
@@ -171,6 +198,7 @@ public sealed class OffscreenBrowser : IDisposable
         }
         finally
         {
+            foregroundMonitoring.Cancel();
             connected = false;
             commands.Writer.TryComplete();
             if (!disposed && !token.IsCancellationRequested && !normalHelperExit)
@@ -181,6 +209,39 @@ public sealed class OffscreenBrowser : IDisposable
                 stopping.Cancel();
                 try { if (helper is { HasExited: false }) helper.Kill(entireProcessTree: true); } catch { }
             }
+        }
+    }
+
+    // Observe the OS window rather than relying on ImGui focus events. The
+    // FFXIV drawing loop can pause entirely while the game is minimized.
+    private async Task TrackGameForegroundAsync(CancellationToken token)
+    {
+        bool? wasForeground = null;
+        try
+        {
+            while (!token.IsCancellationRequested && !disposed)
+            {
+                var window = Native.GetForegroundWindow();
+                if (window != IntPtr.Zero)
+                {
+                    Native.GetWindowThreadProcessId(window, out var processId);
+                    var isForeground = processId == (uint)Environment.ProcessId;
+                    if (isForeground && wasForeground == false)
+                    {
+                        Send(new { type = "resume" });
+                        Interlocked.Increment(ref foregroundRestores);
+                    }
+                    wasForeground = isForeground;
+                }
+                await Task.Delay(250, token);
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            // Monitoring is best effort. A foreground detection failure must
+            // never disconnect the browser or interrupt an active minigame.
+            log.Warning("[BryerGames] Foreground monitor stopped ({Type}).", ex.GetType().Name);
         }
     }
 
@@ -231,23 +292,52 @@ public sealed class OffscreenBrowser : IDisposable
                 int w = reader.ReadInt32(), h = reader.ReadInt32(), n = reader.ReadInt32();
                 if (w < 1 || h < 1 || w > 4096 || h > 3072 || n < 1 || n > 48 * 1024 * 1024)
                     throw new InvalidDataException($"Invalid image frame header (type={type}, width={w}, height={h}, bytes={n}).");
-                // Type 3 is raw BGRA over a local pipe, avoiding per-frame Deflate CPU cost.
-                var pixels = new byte[checked(w * h * 4)];
-                if (type == 3)
+                // Reuse large (>85 KB) frame buffers instead of allocating
+                // on the Large Object Heap at every browser refresh.
+                var byteCount = checked(w * h * 4);
+                byte[]? pixels = ArrayPool<byte>.Shared.Rent(byteCount);
+                Frame? replaced = null;
+                try
                 {
-                    if (n != pixels.Length) throw new InvalidDataException($"Invalid raw frame length: header={n}, expected={pixels.Length}.");
-                    input.ReadExactly(pixels);
+                    if (type == 3)
+                    {
+                        if (n != byteCount) throw new InvalidDataException($"Invalid raw frame length: header={n}, expected={byteCount}.");
+                        input.ReadExactly(pixels.AsSpan(0, byteCount));
+                    }
+                    else
+                    {
+                        var encoded = ReadExact(reader, n);
+                        using var memory = new MemoryStream(encoded);
+                        using var deflate = new System.IO.Compression.DeflateStream(memory, System.IO.Compression.CompressionMode.Decompress);
+                        deflate.ReadExactly(pixels.AsSpan(0, byteCount));
+                    }
+                    lock (latestLock)
+                    {
+                        if (!disposed)
+                        {
+                            replaced = latest;
+                            latest = new Frame(w, h, pixels);
+                            pixels = null; // transferred to the newest pending frame
+                            Interlocked.Increment(ref receivedFrames);
+                        }
+                    }
                 }
-                else
+                finally
                 {
-                    // Compatibility with older helper builds during an incremental update.
-                    var encoded = ReadExact(reader, n);
-                    using var memory = new MemoryStream(encoded);
-                    using var deflate = new System.IO.Compression.DeflateStream(memory, System.IO.Compression.CompressionMode.Decompress);
-                    deflate.ReadExactly(pixels);
+                    if (pixels != null) ArrayPool<byte>.Shared.Return(pixels);
+                    if (replaced != null)
+                    {
+                        Interlocked.Increment(ref replacedBeforeUpload);
+                        ArrayPool<byte>.Shared.Return(replaced.Pixels);
+                    }
                 }
-                lock (latestLock) latest = new Frame(w, h, pixels); // Drop stale frames instead of growing a queue.
-                Interlocked.Increment(ref receivedFrames);
+                // Return transport credit as soon as the complete bitmap has been
+                // received and retained. Do NOT wait for the asynchronous GPU upload
+                // or another ImGui Draw. Only one raw frame may be in the pipe at once;
+                // the consumer keeps at most one READY frame plus one UPLOADING frame.
+                // This removes an entire render/upload/Draw round-trip from the
+                // Chromium pipeline while keeping memory usage bounded.
+                Send(new { type = "frame-ack" });
             }
             else throw new InvalidDataException($"Unknown IPC frame type {type} (v13 protocol).");
             await Task.Yield();
@@ -278,6 +368,7 @@ public sealed class OffscreenBrowser : IDisposable
     public void Draw(float availableWidth, float availableHeight)
     {
         if (disposed) return;
+        Interlocked.Increment(ref drawCount);
         // Actual minigame viewport, capped for predictable CPU/GPU load in FFXIV.
         // The minigame overlays have their own responsive rules on these direct URLs.
         var scale = renderScalePercent / 100f;
@@ -299,6 +390,7 @@ public sealed class OffscreenBrowser : IDisposable
             Send(new { type = "resize", width, height });
         }
         UploadPending();
+        ReportPipelineMetrics();
         var pos = ImGui.GetCursorScreenPos();
         var viewport = new Vector2(availableWidth, availableHeight);
         // ImGui.Image is non-interactive; dragging its pixels can move the entire
@@ -314,22 +406,121 @@ public sealed class OffscreenBrowser : IDisposable
 
     private void UploadPending()
     {
+        if (!legacyTextureUploads)
+        {
+            UploadIntoReusableTexture();
+            return;
+        }
+        UploadPendingLegacy();
+    }
+
+    /// <summary>
+    /// Runs on Dalamud's ImGui draw thread. Map(WRITE_DISCARD) writes into a
+    /// reusable D3D11 dynamic texture; there is no per-frame GPU allocation or
+    /// asynchronous texture-loader queue. The other texture is used for display.
+    /// </summary>
+    private void UploadIntoReusableTexture()
+    {
+        Frame? frame;
+        lock (latestLock) { frame = latest; latest = null; }
+        if (frame == null) return;
+
+        var transferFrameToFallback = false;
+        try
+        {
+            if (disposed || Math.Abs(frame.Width - width) > 2 || Math.Abs(frame.Height - height) > 2)
+                return;
+
+            if (gpuSurfaces == null || gpuSurfaces.Width != frame.Width || gpuSurfaces.Height != frame.Height)
+            {
+                // Allocate only on initial load or a real resolution change.
+                var newSurfaces = new PersistentGpuTextures(textureProvider, frame.Width, frame.Height);
+                var oldSurfaces = gpuSurfaces;
+                gpuSurfaces = newSurfaces;
+                texture = null;
+                oldSurfaces?.Dispose();
+                log.Information("[BryerGames] Created two reusable D3D11 textures ({Width}x{Height}).", frame.Width, frame.Height);
+            }
+
+            var started = Stopwatch.GetTimestamp();
+            if (gpuSurfaces.TryUpdate(frame.Pixels.AsSpan(0, checked(frame.Width * frame.Height * 4))))
+            {
+                texture = gpuSurfaces.Current;
+                Interlocked.Add(ref totalUploadMicroseconds,
+                    (long)Stopwatch.GetElapsedTime(started).TotalMicroseconds);
+                Interlocked.Increment(ref completedUploadSamples);
+                Interlocked.Increment(ref uploadedFrames);
+            }
+            else
+            {
+                // Defensive handling if a driver reports a busy resource despite MapFlags=0.
+                Interlocked.Increment(ref gpuMapSkipped);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Restore the previous, known-working renderer when D3D11 cannot
+            // supply a writable surface. The failure is also written to the
+            // user's standalone diagnostic file (no /xllog needed).
+            legacyTextureUploads = true;
+            texture = null;
+            gpuSurfaces?.Dispose();
+            gpuSurfaces = null;
+            log.Warning("[BryerGames] D3D11 dynamic texture path unavailable ({Type}); using legacy texture uploader.", ex.GetType().Name);
+            AppendRendererDiagnostic("D3D11 fallback: " + ex.GetType().Name + " (" + ex.HResult.ToString("X8") + "): " + ex.Message);
+            transferFrameToFallback = true;
+        }
+        finally
+        {
+            if (transferFrameToFallback)
+            {
+                // Return this valid frame to the ready slot for the legacy path.
+                Frame? displaced;
+                lock (latestLock)
+                {
+                    displaced = latest;
+                    latest = frame;
+                }
+                if (displaced != null)
+                {
+                    Interlocked.Increment(ref replacedBeforeUpload);
+                    ArrayPool<byte>.Shared.Return(displaced.Pixels);
+                }
+            }
+            else ArrayPool<byte>.Shared.Return(frame.Pixels);
+        }
+    }
+
+    private void AppendRendererDiagnostic(string message)
+    {
+        var line = $"{DateTimeOffset.UtcNow:O} {message}{Environment.NewLine}";
+        _ = Task.Run(() =>
+        {
+            try { File.AppendAllText(telemetryFilePath, line); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        });
+    }
+
+    private void UploadPendingLegacy()
+    {
         if (pendingUpload is { IsCompleted: true } completed)
         {
             pendingUpload = null;
+            var completedPixels = uploadingFrame;
+            uploadingFrame = null;
             try
             {
                 var wrap = completed.GetAwaiter().GetResult();
                 if (pendingUploadStarted != 0)
                 {
-                    Interlocked.Add(ref totalUploadMilliseconds,
-                        (long)Stopwatch.GetElapsedTime(pendingUploadStarted).TotalMilliseconds);
+                    Interlocked.Add(ref totalUploadMicroseconds,
+                        (long)Stopwatch.GetElapsedTime(pendingUploadStarted).TotalMicroseconds);
                     Interlocked.Increment(ref completedUploadSamples);
                 }
                 if (disposed || Math.Abs(pendingUploadWidth - width) > 2 || Math.Abs(pendingUploadHeight - height) > 2)
                 {
                     wrap.Dispose();
-                    if (!disposed) Send(new { type = "frame-ack" });
                 }
                 else
                 {
@@ -339,15 +530,17 @@ public sealed class OffscreenBrowser : IDisposable
                     var count = Interlocked.Increment(ref uploadedFrames);
                     if (count == 1 || count == 3 || count % 100 == 0)
                         log.Information("[BryerGames] Browser frame {Count} uploaded ({Width}x{Height}).", count, (int)wrap.Width, (int)wrap.Height);
-                    Send(new { type = "frame-ack" });
                 }
             }
             catch (Exception ex)
             {
                 status = "Could not upload browser image.";
                 log.Warning("[BryerGames] GPU texture upload failed ({Type}).", ex.GetType().Name);
-                // Unblock the remote renderer so a transient failure can recover.
-                Send(new { type = "frame-ack" });
+                // Transport credit was already returned by ReadFramesAsync.
+            }
+            finally
+            {
+                if (completedPixels != null) ArrayPool<byte>.Shared.Return(completedPixels.Pixels);
             }
         }
         if (pendingUpload != null)
@@ -368,7 +561,8 @@ public sealed class OffscreenBrowser : IDisposable
         {
             if (Math.Abs(frame.Width - width) > 2 || Math.Abs(frame.Height - height) > 2)
             {
-                Send(new { type = "frame-ack" }); // Old viewport frame, request the new one.
+                ArrayPool<byte>.Shared.Return(frame.Pixels);
+                // Transport credit was returned when this frame was received.
                 return;
             }
             pendingUploadWidth = frame.Width;
@@ -376,23 +570,67 @@ public sealed class OffscreenBrowser : IDisposable
             pendingUploadStarted = Stopwatch.GetTimestamp();
             try
             {
-                pendingUpload = textureProvider.CreateFromRawAsync(RawImageSpecification.Bgra32(frame.Width, frame.Height), frame.Pixels, "BryerGames helper frame");
+                // A pooled array may have spare capacity; upload only valid pixels.
+                uploadingFrame = frame;
+                pendingUpload = textureProvider.CreateFromRawAsync(
+                    RawImageSpecification.Bgra32(frame.Width, frame.Height),
+                    frame.Pixels.AsMemory(0, checked(frame.Width * frame.Height * 4)),
+                    "BryerGames helper frame");
             }
             catch (Exception ex)
             {
+                uploadingFrame = null;
+                ArrayPool<byte>.Shared.Return(frame.Pixels);
                 log.Warning("[BryerGames] Could not start GPU texture upload ({Type}).", ex.GetType().Name);
-                Send(new { type = "frame-ack" });
             }
         }
-        var reportTicks = Stopwatch.GetTimestamp();
-        if (connected && (lastHealthReport == 0 || Stopwatch.GetElapsedTime(lastHealthReport, reportTicks).TotalSeconds >= 20))
+    }
+
+    // Separate, user-readable diagnostics file: /xllog may filter Information logs.
+    // Collected from Draw so a stalled texture upload still produces a report.
+    private void ReportPipelineMetrics()
+    {
+        if (!connected) return;
+        var now = Stopwatch.GetTimestamp();
+        if (lastHealthReport == 0)
         {
-            lastHealthReport = reportTicks;
-            var samples = Interlocked.Read(ref completedUploadSamples);
-            var averageMs = samples > 0 ? Interlocked.Read(ref totalUploadMilliseconds) / samples : 0;
-            log.Information("[BryerGames] Frame pipeline: received={Received}, GPU uploaded={Uploaded}, upload pending={Pending}, average upload={AverageMs}ms.",
-                Volatile.Read(ref receivedFrames), Volatile.Read(ref uploadedFrames), pendingUpload != null, averageMs);
+            lastHealthReport = now;
+            previousDrawCount = Volatile.Read(ref drawCount);
+            previousReceivedCount = Volatile.Read(ref receivedFrames);
+            previousUploadedCount = Volatile.Read(ref uploadedFrames);
+            previousReplacedCount = Volatile.Read(ref replacedBeforeUpload);
+            previousUploadSamples = Interlocked.Read(ref completedUploadSamples);
+            previousUploadMicroseconds = Interlocked.Read(ref totalUploadMicroseconds);
+            return;
         }
+        var seconds = Stopwatch.GetElapsedTime(lastHealthReport, now).TotalSeconds;
+        if (seconds < 15) return;
+        lastHealthReport = now;
+        var draws = Volatile.Read(ref drawCount);
+        var received = Volatile.Read(ref receivedFrames);
+        var uploaded = Volatile.Read(ref uploadedFrames);
+        var replaced = Volatile.Read(ref replacedBeforeUpload);
+        var samples = Interlocked.Read(ref completedUploadSamples);
+        var uploadMs = Interlocked.Read(ref totalUploadMicroseconds);
+        var newSamples = samples - previousUploadSamples;
+        var avgMs = newSamples > 0 ? (double)(uploadMs - previousUploadMicroseconds) / newSamples / 1000d : 0;
+        var pendingMs = pendingUpload != null && pendingUploadStarted != 0 ?
+            Stopwatch.GetElapsedTime(pendingUploadStarted, now).TotalMilliseconds : 0;
+        var mode = legacyTextureUploads ? "legacy-create-per-frame" : "dynamic-d3d11-pingpong";
+        var line = $"{DateTimeOffset.UtcNow:O} Frame pipeline 15s: game={gameTag}, foregroundRestores={Volatile.Read(ref foregroundRestores)}, renderer={mode}, gpuMapSkipped={Volatile.Read(ref gpuMapSkipped)}, drawFps={(draws - previousDrawCount) / seconds:F1}, receivedFps={(received - previousReceivedCount) / seconds:F1}, uploadedFps={(uploaded - previousUploadedCount) / seconds:F1}, replacedFps={(replaced - previousReplacedCount) / seconds:F1}, uploadAvgMs={avgMs:F1}, pendingUploadMs={pendingMs:F0}, resolution={width}x{height}.";
+        previousDrawCount = draws;
+        previousReceivedCount = received;
+        previousUploadedCount = uploaded;
+        previousReplacedCount = replaced;
+        previousUploadSamples = samples;
+        previousUploadMicroseconds = uploadMs;
+        // Disk I/O must never block ImGui's render thread.
+        _ = Task.Run(() =>
+        {
+            try { File.AppendAllText(telemetryFilePath, line + Environment.NewLine); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        });
     }
 
     private void HandleInput(Vector2 origin, float displayWidth, float displayHeight)
@@ -508,12 +746,34 @@ public sealed class OffscreenBrowser : IDisposable
         // Close the receiving pipe immediately: blocking reads must not outlive
         // the ImGui window or get logged as unexpected helper disconnects.
         try { framePipe?.Dispose(); } catch { }
-        texture?.Dispose();
+        // gpuSurfaces owns both wraps in the optimized renderer. The legacy
+        // renderer owns texture directly. Never dispose the same wrap twice.
+        if (gpuSurfaces != null)
+        {
+            texture = null;
+            gpuSurfaces.Dispose();
+            gpuSurfaces = null;
+        }
+        else texture?.Dispose();
         texture = null;
+        Frame? discarded;
+        lock (latestLock) { discarded = latest; latest = null; }
+        if (discarded != null) ArrayPool<byte>.Shared.Return(discarded.Pixels);
         var upload = pendingUpload;
         pendingUpload = null;
+        var uploading = uploadingFrame;
+        uploadingFrame = null;
         if (upload != null)
-            _ = upload.ContinueWith(t => { if (t.Status == TaskStatus.RanToCompletion) t.Result.Dispose(); else _ = t.Exception; }, TaskScheduler.Default);
+            _ = upload.ContinueWith(t =>
+            {
+                try
+                {
+                    if (t.Status == TaskStatus.RanToCompletion) t.Result.Dispose();
+                    else _ = t.Exception;
+                }
+                finally { if (uploading != null) ArrayPool<byte>.Shared.Return(uploading.Pixels); }
+            }, TaskScheduler.Default);
+        else if (uploading != null) ArrayPool<byte>.Shared.Return(uploading.Pixels);
         // Closing pipes unblocks frame reads. The host has a parent watchdog as a fallback.
         _ = Task.Run(async () =>
         {
@@ -536,6 +796,8 @@ public sealed class OffscreenBrowser : IDisposable
 
     private static class Native
     {
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
         [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int virtualKey);
         [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool GetKeyboardState([Out] byte[] keys);
         [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint virtualKey, uint mapType);

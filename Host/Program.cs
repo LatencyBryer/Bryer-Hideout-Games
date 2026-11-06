@@ -6,6 +6,7 @@
 /* ░░░░ ░░░  ░   ░░  ░░░░░ ░░  ░   */
 /* ░░░░  ░   ░   ░   ░░░░░ ░   ░   */
 
+using System.Buffers;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO.Pipes;
@@ -49,6 +50,10 @@ internal sealed class BrowserHost : IDisposable
     private readonly object browserLock = new();
     // Paint buffers must not contend with CEF input/resize commands.
     private readonly object paintLock = new();
+    // A bounded signal wakes the frame pipe on fresh paint or receive ACK.
+    // The previous fixed-delay poll lost an extra frame interval after ACK.
+    private readonly SemaphoreSlim frameWake = new(0, 1);
+    private int frameWakePending;
     private readonly CancellationTokenSource stop = new();
     private ChromiumWebBrowser? browser;
     private Uri? allowedGameUri;
@@ -62,17 +67,27 @@ internal sealed class BrowserHost : IDisposable
     private int latestPaintWidth;
     private int latestPaintHeight;
     private int dirty = 1;
-    // The Dalamud side explicitly acknowledges a frame after the GPU upload.
-    // Never queue more than one large bitmap across IPC. This is essential for
-    // stable frame pacing in FFXIV while resizing or during heavy site animation.
+    // The Dalamud side acknowledges a frame after reading it from IPC, not
+    // after the GPU upload. The pipe still carries at most one outstanding
+    // raw bitmap; newer frames overwrite an old ready frame on the consumer.
     private int frameCredit = 1;
     private long lastPaintTicks = Stopwatch.GetTimestamp();
     private long lastInvalidateTicks;
-    private int skippedPaints;
+    // Preserve the newest paint while an older bitmap is in the pipe.
+    // Never allocate a queue of full-resolution frames.
+    private int capturedWhileBusy;
+    private int coalescedBeforeSend;
+    private int recoveryInvalidations;
     private long lastTelemetryTicks = Stopwatch.GetTimestamp();
     private int paintCount;
     private int sentFrames;
     private int ackCount;
+    // Lightweight interval diagnostics: no disk I/O in the CEF Paint callback.
+    private int totalPaintCallbacks;
+    private long totalCopyTicks;
+    private long totalWriteTicks;
+    private long totalAckTicks;
+    private long sentFrameAtTicks;
     private string pendingStatus = "Chromium starting...";
     private string? lastStatus;
 
@@ -104,6 +119,17 @@ internal sealed class BrowserHost : IDisposable
             LogFile = Path.Combine(profile, "cef-diagnostics.log"),
             LogSeverity = LogSeverity.Warning,
         };
+        // CefSharp enables GPU acceleration by default. Encourage hardware
+        // rasterization on supported GPUs without bypassing Chromium's driver
+        // blocklist or disabling its software fallback. Offscreen output still
+        // needs a CPU BGRA readback for our existing Dalamud texture pipeline.
+        cef.CefCommandLineArgs.Add("enable-gpu-rasterization");
+        // This is a dedicated, windowless browser hosted by a separate process.
+        // Chromium may throttle requestAnimationFrame/timers when the user Alt+Tabs
+        // away from FFXIV, and the throttling sometimes persists on return.
+        // Keep the renderer responsive without disabling GPU safety protections.
+        cef.CefCommandLineArgs.Add("disable-background-timer-throttling");
+        cef.CefCommandLineArgs.Add("disable-renderer-backgrounding");
         cef.EnableAudio();
         var locales = Path.Combine(baseDirectory, "locales");
         if (Directory.Exists(locales)) cef.LocalesDirPath = locales;
@@ -112,7 +138,7 @@ internal sealed class BrowserHost : IDisposable
             throw new InvalidOperationException("CEF initialization returned false.");
         cefInitialized = true;
         pendingStatus = "Browser ready";
-        LogDiagnostic("Chromium host v16 initialized (IPC v13, SPA navigation guard).");
+        LogDiagnostic("Chromium host v21 initialized (IPC v13, bounded latest-paint buffering and ACK-triggered sender, GPU rasterization requested).");
 
         // Main thread remains responsible for Chromium initialization/shutdown.
         var frames = Task.Run(() => PublishFramesAsync(framePipe, stop.Token));
@@ -141,10 +167,23 @@ internal sealed class BrowserHost : IDisposable
             try { commandPipe.Dispose(); framePipe.Dispose(); } catch { }
             try { Task.WaitAll([frames, commands], TimeSpan.FromSeconds(2)); } catch { }
             lock (browserLock) { browser?.Dispose(); browser = null; }
+            lock (paintLock)
+            {
+                if (latestPaint != null) ArrayPool<byte>.Shared.Return(latestPaint);
+                latestPaint = null;
+            }
             Cef.Shutdown();
             cefInitialized = false;
         }
         return 0;
+    }
+
+    // Never block CEF's paint callback waiting for a pipe writer. Coalesce wake
+    // notifications just as we coalesce the latest pending bitmap.
+    private void WakeFramePublisher()
+    {
+        if (Interlocked.CompareExchange(ref frameWakePending, 1, 0) == 0)
+            frameWake.Release();
     }
 
     private bool ParentAlive()
@@ -184,18 +223,16 @@ internal sealed class BrowserHost : IDisposable
                 if (type == "exit") { stop.Cancel(); break; }
                 if (type == "frame-ack")
                 {
+                    var ackReceivedAt = Stopwatch.GetTimestamp();
+                    var startedAt = Interlocked.Exchange(ref sentFrameAtTicks, 0);
+                    if (startedAt != 0 && ackReceivedAt >= startedAt)
+                        Interlocked.Add(ref totalAckTicks, ackReceivedAt - startedAt);
                     Interlocked.Exchange(ref frameCredit, 1);
                     Interlocked.Increment(ref ackCount);
-                    // Frames skipped during GPU upload have made the last
-                    // delivered image obsolete. Ask CEF for the latest pixels.
-                    if (Interlocked.Exchange(ref skippedPaints, 0) != 0)
-                    {
-                        lock (browserLock)
-                        {
-                            if (browser?.IsBrowserInitialized == true)
-                                browser.GetBrowserHost()?.Invalidate(PaintElementType.View);
-                        }
-                    }
+                    // A newly acknowledged IPC slot may already have a fresher
+                    // paint waiting. Notify the sender immediately instead of
+                    // adding another timer interval to the rendering latency.
+                    WakeFramePublisher();
                     continue;
                 }
                 if (type == "open")
@@ -213,6 +250,7 @@ internal sealed class BrowserHost : IDisposable
                                 browser = null;
                                 lock (paintLock)
                                 {
+                                    if (latestPaint != null) ArrayPool<byte>.Shared.Return(latestPaint);
                                     latestPaint = null;
                                     latestPaintWidth = latestPaintHeight = 0;
                                 }
@@ -248,36 +286,47 @@ internal sealed class BrowserHost : IDisposable
                                 browser.Size = new Size(width, height);
                                 browser.Paint += (_, paint) =>
                                 {
-                                    // CEF provides BGRA directly. Copy while BufferHandle is valid;
-                                    // avoid Bitmap/LockBits/ScreenshotOrNull on every frame.
+                                    // IMPORTANT: CefSharp's default OffScreen render handler
+                                    // otherwise copies the *same entire frame* into its own
+                                    // bitmap after this event. We already own the frame, so
+                                    // suppress that redundant copy (including skipped paints).
+                                    paint.Handled = true;
+                                    if (!paint.IsPopup) Interlocked.Increment(ref totalPaintCallbacks);
                                     if (paint.IsPopup || paint.BufferHandle == IntPtr.Zero ||
                                         paint.Width < 1 || paint.Height < 1 ||
                                         paint.Width > 4096 || paint.Height > 3072) return;
-                                    // Full BGRA copies are expensive. While a frame is in
-                                    // flight (pipe transfer + GPU upload), discard CEF paints
-                                    // instead of allocating/copying a new bitmap for each one.
-                                    // The next ACK requests a fresh paint, not a stale queue.
-                                    if (Volatile.Read(ref frameCredit) == 0)
+                                    // Keep the newest frame even when the one-frame IPC
+                                    // transport is occupied. Previously every busy paint
+                                    // was thrown away and we had to ask CEF to repaint.
+                                    // One pending pooled buffer is the maximum.
+                                    var wasBusy = Volatile.Read(ref frameCredit) == 0;
+                                    var byteCount = checked(paint.Width * paint.Height * 4);
+                                    byte[]? rented = ArrayPool<byte>.Shared.Rent(byteCount);
+                                    byte[]? replaced = null;
+                                    try
                                     {
-                                        Interlocked.Exchange(ref skippedPaints, 1);
-                                        return;
-                                    }
-                                    var bytes = new byte[checked(paint.Width * paint.Height * 4)];
-                                    Marshal.Copy(paint.BufferHandle, bytes, 0, bytes.Length);
-                                    lock (paintLock)
-                                    {
-                                        // Credit may have been consumed during Marshal.Copy.
-                                        if (Volatile.Read(ref frameCredit) == 0)
+                                        var copyStarted = Stopwatch.GetTimestamp();
+                                        Marshal.Copy(paint.BufferHandle, rented, 0, byteCount);
+                                        Interlocked.Add(ref totalCopyTicks, Stopwatch.GetTimestamp() - copyStarted);
+                                        lock (paintLock)
                                         {
-                                            Interlocked.Exchange(ref skippedPaints, 1);
-                                            return;
+                                            replaced = latestPaint;
+                                            latestPaint = rented;
+                                            rented = null; // ownership transferred to PublishFramesAsync
+                                            latestPaintWidth = paint.Width;
+                                            latestPaintHeight = paint.Height;
+                                            Volatile.Write(ref lastPaintTicks, Stopwatch.GetTimestamp());
+                                            Interlocked.Increment(ref paintCount);
+                                            if (wasBusy) Interlocked.Increment(ref capturedWhileBusy);
+                                            if (replaced != null) Interlocked.Increment(ref coalescedBeforeSend);
+                                            Interlocked.Exchange(ref dirty, 1);
                                         }
-                                        latestPaint = bytes;
-                                        latestPaintWidth = paint.Width;
-                                        latestPaintHeight = paint.Height;
-                                        Volatile.Write(ref lastPaintTicks, Stopwatch.GetTimestamp());
-                                        Interlocked.Increment(ref paintCount);
-                                        Interlocked.Exchange(ref dirty, 1);
+                                        WakeFramePublisher();
+                                    }
+                                    finally
+                                    {
+                                        if (rented != null) ArrayPool<byte>.Shared.Return(rented);
+                                        if (replaced != null) ArrayPool<byte>.Shared.Return(replaced);
                                     }
                                 };
                                 browser.FrameLoadEnd += (_, e) =>
@@ -340,6 +389,16 @@ internal sealed class BrowserHost : IDisposable
                             Volatile.Write(ref browserFocused, focus ? 1 : 0);
                             if (!focus) pressedMouseFlags = CefEventFlags.None;
                             control.SendFocusEvent(focus);
+                            break;
+                        case "resume":
+                            // Game regained OS foreground after Alt+Tab. Restore the
+                            // offscreen view and request a new frame without touching
+                            // game state, reloading the page, or stealing keyboard focus.
+                            control.WasHidden(false);
+                            control.Invalidate(PaintElementType.View);
+                            Interlocked.Exchange(ref dirty, 1);
+                            WakeFramePublisher();
+                            LogDiagnostic("FFXIV foreground resumed; offscreen paint refreshed.");
                             break;
                         case "wheel": control.SendMouseWheelEvent(evt, GetInt(root, "horizontal"), GetInt(root, "vertical")); break;
                         case "click":
@@ -406,6 +465,14 @@ internal sealed class BrowserHost : IDisposable
         writer.Write(13); // IPC protocol version
         writer.Flush();
         LogDiagnostic("IPC protocol v13 handshake sent.");
+        var previousPaint = 0;
+        var previousCopied = 0;
+        var previousSent = 0;
+        var previousAck = 0;
+        var previousBusy = 0;
+        var previousCoalesced = 0;
+        var previousRecoveries = 0;
+        long previousCopyTicks = 0, previousWriteTicks = 0, previousAckTicks = 0;
         while (!token.IsCancellationRequested)
         {
             try
@@ -419,31 +486,66 @@ internal sealed class BrowserHost : IDisposable
                     writer.Write(bytes);
                     lastStatus = message;
                 }
-                // CEF can stop emitting Paint notifications after page transitions or
-                // resizes while JavaScript/audio still run. Request a bounded repaint
-                // instead of letting the ImGui texture freeze at the last screenshot.
-                // Do not request a repaint while a previous frame is awaiting upload.
+                // Keep a bounded recovery path for pages that stop emitting
+                // CEF OnPaint entirely. Busy paints are now buffered, not lost,
+                // so they do not require forced Invalidate calls.
                 var nowTicks = Stopwatch.GetTimestamp();
+                var elapsedSincePaintMs = Stopwatch.GetElapsedTime(Volatile.Read(ref lastPaintTicks), nowTicks).TotalMilliseconds;
                 if (Volatile.Read(ref frameCredit) != 0 &&
-                    Stopwatch.GetElapsedTime(Volatile.Read(ref lastPaintTicks), nowTicks).TotalMilliseconds > 420 &&
-                    (lastInvalidateTicks == 0 || Stopwatch.GetElapsedTime(lastInvalidateTicks, nowTicks).TotalMilliseconds > 550))
+                    elapsedSincePaintMs > 420d &&
+                    (lastInvalidateTicks == 0 ||
+                     Stopwatch.GetElapsedTime(lastInvalidateTicks, nowTicks).TotalMilliseconds >= 550d))
                 {
-                    lastInvalidateTicks = nowTicks;
                     lock (browserLock)
                     {
-                        if (browser?.IsBrowserInitialized == true)
+                        if (browser?.IsBrowserInitialized == true && Volatile.Read(ref frameCredit) != 0)
                         {
+                            // Only advance the watchdog when Invalidate is issued.
+                            // A new Paint will automatically wake the frame publisher.
                             browser.GetBrowserHost()?.Invalidate(PaintElementType.View);
-                            // Repaint will deliver another BGRA buffer through Paint.
+                            lastInvalidateTicks = nowTicks;
+                            Interlocked.Increment(ref recoveryInvalidations);
                             Interlocked.Exchange(ref dirty, 1);
                         }
                     }
                 }
-                if (Stopwatch.GetElapsedTime(lastTelemetryTicks, nowTicks).TotalSeconds >= 15)
+                var telemetrySeconds = Stopwatch.GetElapsedTime(lastTelemetryTicks, nowTicks).TotalSeconds;
+                if (telemetrySeconds >= 15)
                 {
                     lastTelemetryTicks = nowTicks;
                     if (browser != null)
-                        LogDiagnostic($"Frame pipeline: copied={Volatile.Read(ref paintCount)}, sent={Volatile.Read(ref sentFrames)}, ack={Volatile.Read(ref ackCount)}, credit={Volatile.Read(ref frameCredit)}, skippedPaint={Volatile.Read(ref skippedPaints)}.");
+                    {
+                        var paints = Volatile.Read(ref totalPaintCallbacks);
+                        var copies = Volatile.Read(ref paintCount);
+                        var sends = Volatile.Read(ref sentFrames);
+                        var acks = Volatile.Read(ref ackCount);
+                        var busy = Volatile.Read(ref capturedWhileBusy);
+                        var coalesced = Volatile.Read(ref coalescedBeforeSend);
+                        var recoveries = Volatile.Read(ref recoveryInvalidations);
+                        var copyTicks = Interlocked.Read(ref totalCopyTicks);
+                        var writeTicks = Interlocked.Read(ref totalWriteTicks);
+                        var ackTicks = Interlocked.Read(ref totalAckTicks);
+                        var copiedDelta = copies - previousCopied;
+                        var sentDelta = sends - previousSent;
+                        var ackDelta = acks - previousAck;
+                        var copyMs = copiedDelta > 0 ?
+                            1000.0 * (copyTicks - previousCopyTicks) / Stopwatch.Frequency / copiedDelta : 0;
+                        var writeMs = sentDelta > 0 ?
+                            1000.0 * (writeTicks - previousWriteTicks) / Stopwatch.Frequency / sentDelta : 0;
+                        var ackMs = ackDelta > 0 ?
+                            1000.0 * (ackTicks - previousAckTicks) / Stopwatch.Frequency / ackDelta : 0;
+                        LogDiagnostic($"Frame pipeline 15s: paintFps={(paints - previousPaint) / telemetrySeconds:F1}, copiedFps={copiedDelta / telemetrySeconds:F1}, sentFps={sentDelta / telemetrySeconds:F1}, ackFps={ackDelta / telemetrySeconds:F1}, bufferedWhileBusy={busy - previousBusy}, coalescedBeforeSend={coalesced - previousCoalesced}, repaintRecoveries={recoveries - previousRecoveries}, copyAvgMs={copyMs:F1}, pipeWriteAvgMs={writeMs:F1}, ackCycleAvgMs={ackMs:F1}, credit={Volatile.Read(ref frameCredit)}.");
+                        previousPaint = paints;
+                        previousCopied = copies;
+                        previousSent = sends;
+                        previousAck = acks;
+                        previousBusy = busy;
+                        previousCoalesced = coalesced;
+                        previousRecoveries = recoveries;
+                        previousCopyTicks = copyTicks;
+                        previousWriteTicks = writeTicks;
+                        previousAckTicks = ackTicks;
+                    }
                 }
                 if (Volatile.Read(ref frameCredit) != 0 && Interlocked.Exchange(ref dirty, 0) != 0)
                 {
@@ -468,15 +570,27 @@ internal sealed class BrowserHost : IDisposable
                     }
                     else
                     {
-                        // Raw BGRA, local pipe. No Deflate compression/decompression.
-                        writer.Write((byte)3);
-                        writer.Write(w);
-                        writer.Write(h);
-                        writer.Write(pixels.Length);
-                        writer.Write(pixels);
-                        var count = Interlocked.Increment(ref sentFrames);
-                        if (count <= 3 || count % 120 == 0)
-                            LogDiagnostic($"Frame {count}: {w}x{h}, raw BGRA over local IPC.");
+                        // Rented buffers can be larger than the valid image payload.
+                        // Return the buffer only after the pipe has consumed its bytes.
+                        try
+                        {
+                            var byteCount = checked(w * h * 4);
+                            var writeStarted = Stopwatch.GetTimestamp();
+                            // ACK cycle starts before writing and ends when the
+                            // receiver has consumed the entire frame. GPU upload
+                            // proceeds independently on the Dalamud side.
+                            Interlocked.Exchange(ref sentFrameAtTicks, writeStarted);
+                            writer.Write((byte)3);
+                            writer.Write(w);
+                            writer.Write(h);
+                            writer.Write(byteCount);
+                            writer.Write(pixels, 0, byteCount);
+                            Interlocked.Add(ref totalWriteTicks, Stopwatch.GetTimestamp() - writeStarted);
+                            var count = Interlocked.Increment(ref sentFrames);
+                            if (count <= 3 || count % 120 == 0)
+                                LogDiagnostic($"Frame {count}: {w}x{h}, raw BGRA over local IPC.");
+                        }
+                        finally { ArrayPool<byte>.Shared.Return(pixels); }
                     }
                 }
                 writer.Flush();
@@ -495,9 +609,15 @@ internal sealed class BrowserHost : IDisposable
                 LogDiagnostic("Frame capture failure: " + ex.GetType().Name);
                 Interlocked.Exchange(ref dirty, 1);
             }
-            // The old path silently reduced output to ~30 FPS until the user
-            // clicked the browser. Keep the requested cadence on login screens too.
-            try { await Task.Delay(Math.Max(16, 1000 / Volatile.Read(ref browserFrameRate)), token); }
+            // Wake immediately when either a new paint is ready or transport
+            // credit returns. The timeout still checks idle recovery/telemetry.
+            // A single semaphore slot prevents unbounded wake notifications.
+            try
+            {
+                var pollMs = Math.Max(16d, 1000d / Math.Clamp(Volatile.Read(ref browserFrameRate), 30, 60));
+                if (await frameWake.WaitAsync(TimeSpan.FromMilliseconds(pollMs), token))
+                    Interlocked.Exchange(ref frameWakePending, 0);
+            }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
         }
     }

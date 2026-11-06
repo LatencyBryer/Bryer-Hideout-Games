@@ -71,7 +71,6 @@ $dpapi = Join-Path $pluginOut 'System.Security.Cryptography.ProtectedData.dll'
 if (Test-Path -LiteralPath $dpapi) { Copy-Item -LiteralPath $dpapi -Destination $package }
 Copy-Item -LiteralPath (Join-Path $root 'Resources\minigame-icons.bgra') -Destination $package
 Copy-Item -LiteralPath (Join-Path $root 'icon.png') -Destination $package
-Copy-Item -LiteralPath (Join-Path $root 'THIRD_PARTY_NOTICES.md') -Destination $package
 $manifest = $sourceManifest
 $manifest.AssemblyVersion = $assembledVersion
 [IO.File]::WriteAllText((Join-Path $package 'BryersHideoutGames.json'), ($manifest | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
