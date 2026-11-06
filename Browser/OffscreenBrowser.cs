@@ -55,7 +55,30 @@ public sealed class OffscreenBrowser : IDisposable
     private volatile bool connected;
     private volatile bool disposed;
     private bool mouseOver;
-    private bool hasFocus;
+    // Only an explicit click on the web canvas grants keyboard ownership.
+    // Never steal keys merely because the browser window is visible.
+    private volatile bool hasFocus;
+    // Framework.Update may request a blur when FFXIV loses OS foreground.
+    // It never touches the input HashSets from another callback.
+    private int focusReleaseRequested;
+    private readonly HashSet<int> ignoreUntilReleased = [];
+
+    public bool CapturesKeyboard => !disposed && connected && hasFocus && IsGameWindowForeground();
+
+    public void RequestKeyboardFocusRelease()
+    {
+        if (hasFocus) Interlocked.Exchange(ref focusReleaseRequested, 1);
+    }
+
+    public void ReleaseFocusFromWindow() => ReleaseKeyboardFocus();
+
+    private static bool IsGameWindowForeground()
+    {
+        var active = Native.GetForegroundWindow();
+        if (active == IntPtr.Zero) return false;
+        _ = Native.GetWindowThreadProcessId(active, out var pid);
+        return pid == (uint)Environment.ProcessId;
+    }
     private bool leftMouseHeld;
     private bool rightMouseHeld;
     private bool middleMouseHeld;
@@ -321,6 +344,7 @@ public sealed class OffscreenBrowser : IDisposable
         if (!Destinations.IsAllowedGameUrl(target.AbsoluteUri))
             throw new InvalidOperationException("Navigation outside direct minigame hosts is blocked.");
         Volatile.Write(ref targetUrl, target);
+        ReleaseKeyboardFocus();
         Send(new { type = "open", url = target.AbsoluteUri, fps = fpsLimit });
     }
 
@@ -594,7 +618,16 @@ public sealed class OffscreenBrowser : IDisposable
 
     private void HandleInput(Vector2 origin, float displayWidth, float displayHeight)
     {
-        if (!connected) return;
+        if (!connected)
+        {
+            ReleaseKeyboardFocus();
+            return;
+        }
+        // No background focus monitor or CEF scheduling changes: the existing
+        // Draw and Framework.Update callbacks are sufficient for input gating.
+        var foreground = IsGameWindowForeground();
+        if (Interlocked.Exchange(ref focusReleaseRequested, 0) != 0 || !foreground)
+            ReleaseKeyboardFocus();
         var position = ImGui.GetMousePos();
         var inside = position.X >= origin.X && position.X < origin.X + displayWidth &&
                      position.Y >= origin.Y && position.Y < origin.Y + displayHeight;
@@ -621,12 +654,15 @@ public sealed class OffscreenBrowser : IDisposable
         }
         mouseOver = hovered;
 
-        // Focus first so the following mouse-down reaches an active CEF view.
-        if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
-        {
-            hasFocus = true;
-            Send(new { type = "focus", value = true });
-        }
+        // Acquire keyboard focus only through a deliberate click on the web
+        // surface, not when opening the game or simply hovering the plugin.
+        if (foreground && hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+            AcquireKeyboardFocus();
+        else if (hasFocus && !dragHeld &&
+                 (ImGui.IsMouseClicked(ImGuiMouseButton.Left) ||
+                  ImGui.IsMouseClicked(ImGuiMouseButton.Right) ||
+                  ImGui.IsMouseClicked(ImGuiMouseButton.Middle)))
+            ReleaseKeyboardFocus();
         // Click-down is sent only over the browser surface, but click-up is
         // always sent for a captured button so CEF never gets stuck dragging.
         SendMouse(ImGuiMouseButton.Left, "left", x, y, hovered, ref leftMouseHeld);
@@ -640,18 +676,55 @@ public sealed class OffscreenBrowser : IDisposable
             if (wheel != 0 || wheelH != 0)
                 Send(new { type = "wheel", x, y, vertical = (int)(wheel * 120), horizontal = (int)(wheelH * 120) });
         }
-        else if (!dragHeld && hasFocus && !ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows))
+        if (hasFocus && !ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows))
+            ReleaseKeyboardFocus();
+        if (!CapturesKeyboard) return;
+
+        // Ask ImGui to capture keyboard input only for the focused web canvas.
+        // IKeyState.ClearAll on the existing Framework.Update callback covers
+        // the game's separate key state (and only runs while captured).
+        ImGui.GetIO().WantCaptureKeyboard = true;
+        if ((Native.GetAsyncKeyState(0x1B) & 0x8000) != 0)
         {
-            hasFocus = false;
-            Send(new { type = "focus", value = false });
-            heldKeys.Clear();
+            // Esc immediately hands the keyboard back to FFXIV.
+            ReleaseKeyboardFocus();
+            return;
         }
-        if (hasFocus && ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows) &&
-            Stopwatch.GetElapsedTime(lastKeyboardPollTicks, now).TotalMilliseconds >= 12)
+        if (Stopwatch.GetElapsedTime(lastKeyboardPollTicks, now).TotalMilliseconds >= 12)
         {
             lastKeyboardPollTicks = now;
             ForwardKeyboard();
         }
+    }
+
+    private void AcquireKeyboardFocus()
+    {
+        if (hasFocus || !IsGameWindowForeground()) return;
+        heldKeys.Clear();
+        ignoreUntilReleased.Clear();
+        // A key held BEFORE clicking the game is not a new web keypress.
+        // Releasing it once is required before it can reach the browser.
+        for (var vk = 8; vk < 255; vk++)
+            if ((Native.GetAsyncKeyState(vk) & 0x8000) != 0)
+                ignoreUntilReleased.Add(vk);
+        hasFocus = true;
+        Send(new { type = "focus", value = true });
+    }
+
+    private void ReleaseKeyboardFocus()
+    {
+        if (!hasFocus) return;
+        hasFocus = false;
+        // Release remote key-downs explicitly, even when focus is lost while
+        // a movement/bet key is held; otherwise CEF can retain a stuck key.
+        foreach (var vk in heldKeys)
+        {
+            var scan = (int)Native.MapVirtualKey((uint)vk, 0);
+            Send(new { type = "key", vk, scan, down = false, modifiers = 0 });
+        }
+        heldKeys.Clear();
+        ignoreUntilReleased.Clear();
+        Send(new { type = "focus", value = false });
     }
 
     private void SendMouse(ImGuiMouseButton button, string name, int x, int y, bool hovered, ref bool held)
@@ -672,15 +745,25 @@ public sealed class OffscreenBrowser : IDisposable
     {
         var keyboard = new byte[256];
         if (!Native.GetKeyboardState(keyboard)) return;
-        var ctrl = (keyboard[0x11] & 0x80) != 0;
-        var shift = (keyboard[0x10] & 0x80) != 0;
-        var alt = (keyboard[0x12] & 0x80) != 0;
+        // Physical modifier state is more reliable than GetKeyboardState on
+        // the Dalamud draw thread (notably for Ctrl+Shift+F8/F9 diagnostics).
+        var ctrl = (Native.GetAsyncKeyState(0x11) & 0x8000) != 0;
+        var shift = (Native.GetAsyncKeyState(0x10) & 0x8000) != 0;
+        var alt = (Native.GetAsyncKeyState(0x12) & 0x8000) != 0;
+        keyboard[0x11] = ctrl ? (byte)0x80 : (byte)0;
+        keyboard[0x10] = shift ? (byte)0x80 : (byte)0;
+        keyboard[0x12] = alt ? (byte)0x80 : (byte)0;
         var modifiers = (ctrl ? 1 : 0) | (shift ? 2 : 0) | (alt ? 4 : 0);
         for (var vk = 8; vk < 255; vk++)
         {
-            if (vk is 16 or 17 or 18 or 91 or 92) continue;
-            if (vk >= 112 && vk <= 123) continue;
+            if (vk is 16 or 17 or 18 or 91 or 92 or 160 or 161 or 162 or 163 or 164 or 165) continue;
+            if (vk >= 112 && vk <= 123 && vk is not (119 or 120)) continue;
             var down = (Native.GetAsyncKeyState(vk) & 0x8000) != 0;
+            if (ignoreUntilReleased.Contains(vk))
+            {
+                if (!down) ignoreUntilReleased.Remove(vk);
+                continue;
+            }
             if (down == heldKeys.Contains(vk)) continue;
             if (down) heldKeys.Add(vk); else heldKeys.Remove(vk);
             var scan = (int)Native.MapVirtualKey((uint)vk, 0);
@@ -696,6 +779,7 @@ public sealed class OffscreenBrowser : IDisposable
     public void Dispose()
     {
         if (disposed) return;
+        ReleaseKeyboardFocus();
         // Flag local closure BEFORE tearing down pipes so EOF is expected, not ERR.
         disposed = true;
         // Ask Chromium to exit through IPC before any forced process termination.
@@ -755,6 +839,8 @@ public sealed class OffscreenBrowser : IDisposable
 
     private static class Native
     {
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
         [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int virtualKey);
         [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool GetKeyboardState([Out] byte[] keys);
         [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint virtualKey, uint mapType);

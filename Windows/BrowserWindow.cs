@@ -24,6 +24,9 @@ public sealed class BrowserWindow : Window, IDisposable
     private bool applyScreenSize;
     private Vector2 lastActualWindowSize;
     public SiteDestination? CurrentGame => current;
+    public bool CapturesKeyboard => IsOpen && Collapsed != true && content?.CapturesKeyboard == true;
+    public bool IsBrowserCollapsed => Collapsed == true;
+    public void RequestKeyboardFocusRelease() => content?.RequestKeyboardFocusRelease();
 
     public BrowserWindow(Plugin plugin) : base("Bryer's Hideout - Minigame###BryerGamesGame",
         ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)
@@ -52,6 +55,7 @@ public sealed class BrowserWindow : Window, IDisposable
 
     public override void PreDraw()
     {
+        if (Collapsed == true) content?.ReleaseFocusFromWindow();
         // Prevent dragging the web surface from moving the Plugin window.
         // Leave normal title-bar dragging and edge resizing enabled.
         previousTitleBarOnly = ImGui.GetIO().ConfigWindowsMoveFromTitleBarOnly;

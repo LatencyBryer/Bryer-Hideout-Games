@@ -30,6 +30,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IPluginLog PluginLog { get; private set; } = null!;
     [PluginService] internal static ITextureProvider TextureService { get; private set; } = null!;
     [PluginService] internal static IFramework Framework { get; private set; } = null!;
+    [PluginService] internal static IKeyState KeyState { get; private set; } = null!;
 
     private readonly WindowSystem windows = new("BryersHideoutGames");
     private readonly GameLauncherWindow launcher;
@@ -178,8 +179,17 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnFrameworkUpdate(IFramework _)
     {
+        if (disposed) return;
+        // Reuse the existing framework callback. No foreground polling task,
+        // thread-priority changes or Chromium flags are introduced here.
+        var foreground = IsThisGameForeground();
+        if (browser.IsOpen && (!foreground || browser.IsBrowserCollapsed))
+            browser.RequestKeyboardFocusRelease();
+        else if (foreground && browser.CapturesKeyboard)
+            KeyState.ClearAll();
+
         var limit = gameFpsBudget;
-        if (disposed || limit == 0 || !browser.IsOpen || !IsThisGameForeground())
+        if (limit == 0 || !browser.IsOpen || !foreground)
         {
             lastBudgetTick = 0;
             return;
