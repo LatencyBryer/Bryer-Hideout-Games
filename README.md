@@ -1,4 +1,6 @@
-## [W.I.P]
+<h1 align="center">
+  <strong>[W.I.P] *Not recommended to use yet</strong>
+</h1>
 
 <p align="center">
   <img src="icon.png" alt="Bryer's Hideout Games" width="128" />
