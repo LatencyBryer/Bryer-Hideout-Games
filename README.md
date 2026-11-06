@@ -16,6 +16,23 @@
 
 ---
 
+## 📥 Installation
+
+### Dalamud custom repository
+
+1. Open FFXIV through XIVLauncher with Dalamud enabled.
+2. Type `/xlsettings` and open **Experimental → Custom Plugin Repositories**.
+3. Add the following address and enable it:
+
+   ```text
+   https://plugins.bybryer.com/repo.json
+   ```
+
+4. Open `/xlplugins`, search for **Bryer's Hideout Games**, and install it.
+5. Type `/bryergames` to open the launcher.
+
+---
+
 ## ✨ What I made
 
 I built **Bryer's Hideout Games** to bring the minigames from [Bryer's Hideout](https://minigames.bybryer.com) into FFXIV without sending you back and forth between the game and your desktop browser.
@@ -47,21 +64,6 @@ Type `/bryergames`, choose a game, and play in a movable, resizable window.
 
 The launcher is always available through **`/bryergames`**. Compact is the default screen mode. Games unavailable in Compact appear dimmed and tell you to switch to Desktop on hover.
 
-## 📥 Installation
-
-### Option A — Dalamud custom repository *(recommended after the first GitHub Release)*
-
-1. Open FFXIV through XIVLauncher with Dalamud enabled.
-2. Type `/xlsettings` and open **Experimental → Custom Plugin Repositories**.
-3. Add the following address and enable it:
-
-   ```text
-   https://raw.githubusercontent.com/LatencyBryer/Bryer-Hideout-Games/main/repo.json
-   ```
-
-4. Open `/xlplugins`, find **Bryer's Hideout Games**, and install it.
-5. Type `/bryergames` to open the launcher.
-
 ## 🔑 Access code & account
 
 1. Ask your Venue Host for your **access code**.
@@ -69,7 +71,7 @@ The launcher is always available through **`/bryergames`**. Compact is the defau
 3. After verification, choose a game or use one of its slash commands.
 4. Select **Log Off** to clear the local link and browser profile when changing accounts.
 
-I encrypt the saved code/token with Windows DPAPI for your Windows user. The plugin does **not** include master keys, backend credentials or a shared access code.
+I encrypt the saved code/token with Windows DPAPI for your Windows user.
 
 > [!CAUTION]
 > Keep your access code private.
