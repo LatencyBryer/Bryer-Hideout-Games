@@ -25,7 +25,9 @@ using Dalamud.Plugin.Services;
 
 namespace BryersHideoutGames.Browser;
 
+/// <summary>
 /// ImGui/IPC side only. CefSharp assemblies live exclusively in the external executable.
+/// </summary>
 public sealed class OffscreenBrowser : IDisposable
 {
     private readonly IPluginLog log;
@@ -49,7 +51,8 @@ public sealed class OffscreenBrowser : IDisposable
     private bool leftMouseHeld;
     private bool rightMouseHeld;
     private bool middleMouseHeld;
-    // reduces expensive full-frame readback, IPC traffic, and GPU uploads.
+    // The remote Chromium surface is deliberately smaller than the ImGui rectangle.
+    // This reduces expensive full-frame readback, IPC traffic, and GPU uploads.
     private int width = 1000;
     private int height = 739;
     private int resizeCandidateWidth = 1000;
@@ -68,6 +71,8 @@ public sealed class OffscreenBrowser : IDisposable
     private int pendingUploadHeight;
     private long lastUploadWarning;
     private long lastHealthReport;
+    private long totalUploadMilliseconds;
+    private long completedUploadSamples;
     private Uri targetUrl;
 
     private sealed record Frame(int Width, int Height, byte[] Pixels);
@@ -84,7 +89,7 @@ public sealed class OffscreenBrowser : IDisposable
         this.renderScalePercent = Math.Clamp(renderScalePercent, 55, 100);
         if (compactMode)
         {
-            // Start Chromium at a portrait viewport before the first
+            // Start Chromium at a narrow portrait viewport before the first
             // UI draw. Responsive mobile CSS is active from the first load.
             width = resizeCandidateWidth = 430;
             height = resizeCandidateHeight = 755;
@@ -110,7 +115,7 @@ public sealed class OffscreenBrowser : IDisposable
             };
             psi.ArgumentList.Add(pipeId);
             psi.ArgumentList.Add(Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            psi.ArgumentList.Add(profile); // Access codes are sent over the private pipe
+            psi.ArgumentList.Add(profile); // Access codes are sent over the private pipe, NEVER via command-line args.
             helper = Process.Start(psi) ?? throw new InvalidOperationException("Could not launch external browser process.");
             log.Information("[BryerGames] Launched isolated Chromium helper for {Destination} (PID {ProcessId}).", destination, helper.Id);
 
@@ -135,7 +140,7 @@ public sealed class OffscreenBrowser : IDisposable
         catch (Exception ex)
         {
             // The helper can finish normally before the pipe reader observes EOF.
-            // Keep genuine crashes visible
+            // Keep genuine crashes visible, but don't report an expected close as ERR.
             var exitCode = -1;
             try
             {
@@ -183,7 +188,20 @@ public sealed class OffscreenBrowser : IDisposable
     {
         using var writer = new StreamWriter(output, new UTF8Encoding(false), 4096, leaveOpen: true) { AutoFlush = true };
         await foreach (var message in commands.Reader.ReadAllAsync(token))
-            await writer.WriteLineAsync(message.AsMemory(), token);
+        {
+            var nextMessage = message;
+            // Mouse moves can arrive faster than the pipe/CEF renderer can
+            // process them. Collapse only consecutive moves, preserving the
+            // order of clicks, releases, wheel events and keystrokes.
+            if (message.StartsWith("{\"type\":\"move\"", StringComparison.Ordinal))
+            {
+                while (commands.Reader.TryPeek(out var next) &&
+                       next.StartsWith("{\"type\":\"move\"", StringComparison.Ordinal) &&
+                       commands.Reader.TryRead(out var fresher))
+                    nextMessage = fresher;
+            }
+            await writer.WriteLineAsync(nextMessage.AsMemory(), token);
+        }
     }
 
     private async Task ReadFramesAsync(Stream input, CancellationToken token)
@@ -302,6 +320,12 @@ public sealed class OffscreenBrowser : IDisposable
             try
             {
                 var wrap = completed.GetAwaiter().GetResult();
+                if (pendingUploadStarted != 0)
+                {
+                    Interlocked.Add(ref totalUploadMilliseconds,
+                        (long)Stopwatch.GetElapsedTime(pendingUploadStarted).TotalMilliseconds);
+                    Interlocked.Increment(ref completedUploadSamples);
+                }
                 if (disposed || Math.Abs(pendingUploadWidth - width) > 2 || Math.Abs(pendingUploadHeight - height) > 2)
                 {
                     wrap.Dispose();
@@ -364,8 +388,10 @@ public sealed class OffscreenBrowser : IDisposable
         if (connected && (lastHealthReport == 0 || Stopwatch.GetElapsedTime(lastHealthReport, reportTicks).TotalSeconds >= 20))
         {
             lastHealthReport = reportTicks;
-            log.Information("[BryerGames] Frame pipeline: received={Received}, GPU uploaded={Uploaded}, upload pending={Pending}.",
-                Volatile.Read(ref receivedFrames), Volatile.Read(ref uploadedFrames), pendingUpload != null);
+            var samples = Interlocked.Read(ref completedUploadSamples);
+            var averageMs = samples > 0 ? Interlocked.Read(ref totalUploadMilliseconds) / samples : 0;
+            log.Information("[BryerGames] Frame pipeline: received={Received}, GPU uploaded={Uploaded}, upload pending={Pending}, average upload={AverageMs}ms.",
+                Volatile.Read(ref receivedFrames), Volatile.Read(ref uploadedFrames), pendingUpload != null, averageMs);
         }
     }
 

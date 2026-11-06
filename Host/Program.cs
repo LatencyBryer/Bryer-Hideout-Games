@@ -47,13 +47,14 @@ internal sealed class BrowserHost : IDisposable
     private readonly int parentId;
     private readonly string profile;
     private readonly object browserLock = new();
+    // Paint buffers must not contend with CEF input/resize commands.
+    private readonly object paintLock = new();
     private readonly CancellationTokenSource stop = new();
     private ChromiumWebBrowser? browser;
     private Uri? allowedGameUri;
     private bool cefInitialized;
     private int width = 720, height = 490;
-    // Keep browser work bounded even when the site has constant animated effects.
-    private const int IdleCaptureIntervalMs = 33;
+    // Honor the configured FPS before and after clicking the browser surface.
     private int browserFrameRate = 30;
     private int browserFocused;
     private CefEventFlags pressedMouseFlags = CefEventFlags.None;
@@ -67,7 +68,7 @@ internal sealed class BrowserHost : IDisposable
     private int frameCredit = 1;
     private long lastPaintTicks = Stopwatch.GetTimestamp();
     private long lastInvalidateTicks;
-    private long lastCopiedPaintTicks;
+    private int skippedPaints;
     private long lastTelemetryTicks = Stopwatch.GetTimestamp();
     private int paintCount;
     private int sentFrames;
@@ -185,6 +186,16 @@ internal sealed class BrowserHost : IDisposable
                 {
                     Interlocked.Exchange(ref frameCredit, 1);
                     Interlocked.Increment(ref ackCount);
+                    // Frames skipped during GPU upload have made the last
+                    // delivered image obsolete. Ask CEF for the latest pixels.
+                    if (Interlocked.Exchange(ref skippedPaints, 0) != 0)
+                    {
+                        lock (browserLock)
+                        {
+                            if (browser?.IsBrowserInitialized == true)
+                                browser.GetBrowserHost()?.Invalidate(PaintElementType.View);
+                        }
+                    }
                     continue;
                 }
                 if (type == "open")
@@ -200,8 +211,11 @@ internal sealed class BrowserHost : IDisposable
                             {
                                 browser.Dispose();
                                 browser = null;
-                                latestPaint = null;
-                                latestPaintWidth = latestPaintHeight = 0;
+                                lock (paintLock)
+                                {
+                                    latestPaint = null;
+                                    latestPaintWidth = latestPaintHeight = 0;
+                                }
                                 Interlocked.Exchange(ref frameCredit, 1);
                             }
                             if (browser == null)
@@ -239,26 +253,32 @@ internal sealed class BrowserHost : IDisposable
                                     if (paint.IsPopup || paint.BufferHandle == IntPtr.Zero ||
                                         paint.Width < 1 || paint.Height < 1 ||
                                         paint.Width > 4096 || paint.Height > 3072) return;
-                                    // Do not copy every paint while the GPU is still uploading
-                                    // the previous image. Keep a recent frame, not a backlog.
-                                    var tick = Stopwatch.GetTimestamp();
-                                    var copyIntervalMs = Math.Max(12, 1000 / Math.Clamp(Volatile.Read(ref browserFrameRate), 30, 60));
-                                    if (Volatile.Read(ref frameCredit) == 0 &&
-                                        lastCopiedPaintTicks != 0 &&
-                                        Stopwatch.GetElapsedTime(lastCopiedPaintTicks, tick).TotalMilliseconds < copyIntervalMs)
+                                    // Full BGRA copies are expensive. While a frame is in
+                                    // flight (pipe transfer + GPU upload), discard CEF paints
+                                    // instead of allocating/copying a new bitmap for each one.
+                                    // The next ACK requests a fresh paint, not a stale queue.
+                                    if (Volatile.Read(ref frameCredit) == 0)
+                                    {
+                                        Interlocked.Exchange(ref skippedPaints, 1);
                                         return;
-                                    lastCopiedPaintTicks = tick;
+                                    }
                                     var bytes = new byte[checked(paint.Width * paint.Height * 4)];
                                     Marshal.Copy(paint.BufferHandle, bytes, 0, bytes.Length);
-                                    lock (browserLock)
+                                    lock (paintLock)
                                     {
+                                        // Credit may have been consumed during Marshal.Copy.
+                                        if (Volatile.Read(ref frameCredit) == 0)
+                                        {
+                                            Interlocked.Exchange(ref skippedPaints, 1);
+                                            return;
+                                        }
                                         latestPaint = bytes;
                                         latestPaintWidth = paint.Width;
                                         latestPaintHeight = paint.Height;
+                                        Volatile.Write(ref lastPaintTicks, Stopwatch.GetTimestamp());
+                                        Interlocked.Increment(ref paintCount);
+                                        Interlocked.Exchange(ref dirty, 1);
                                     }
-                                    Volatile.Write(ref lastPaintTicks, Stopwatch.GetTimestamp());
-                                    Interlocked.Increment(ref paintCount);
-                                    Interlocked.Exchange(ref dirty, 1);
                                 };
                                 browser.FrameLoadEnd += (_, e) =>
                                 {
@@ -423,18 +443,24 @@ internal sealed class BrowserHost : IDisposable
                 {
                     lastTelemetryTicks = nowTicks;
                     if (browser != null)
-                        LogDiagnostic($"Frame pipeline: paints={Volatile.Read(ref paintCount)}, sent={Volatile.Read(ref sentFrames)}, ack={Volatile.Read(ref ackCount)}, credit={Volatile.Read(ref frameCredit)}.");
+                        LogDiagnostic($"Frame pipeline: copied={Volatile.Read(ref paintCount)}, sent={Volatile.Read(ref sentFrames)}, ack={Volatile.Read(ref ackCount)}, credit={Volatile.Read(ref frameCredit)}, skippedPaint={Volatile.Read(ref skippedPaints)}.");
                 }
                 if (Volatile.Read(ref frameCredit) != 0 && Interlocked.Exchange(ref dirty, 0) != 0)
                 {
                     byte[]? pixels;
                     int w, h;
-                    lock (browserLock)
+                    lock (paintLock)
                     {
                         pixels = latestPaint;
                         w = latestPaintWidth;
                         h = latestPaintHeight;
-                        latestPaint = null;
+                        if (pixels != null)
+                        {
+                            // Reserve the only in-flight frame before releasing
+                            // the paint lock, avoiding stale concurrent copies.
+                            Interlocked.Exchange(ref frameCredit, 0);
+                            latestPaint = null;
+                        }
                     }
                     if (pixels == null)
                     {
@@ -443,7 +469,6 @@ internal sealed class BrowserHost : IDisposable
                     else
                     {
                         // Raw BGRA, local pipe. No Deflate compression/decompression.
-                        Interlocked.Exchange(ref frameCredit, 0);
                         writer.Write((byte)3);
                         writer.Write(w);
                         writer.Write(h);
@@ -470,7 +495,9 @@ internal sealed class BrowserHost : IDisposable
                 LogDiagnostic("Frame capture failure: " + ex.GetType().Name);
                 Interlocked.Exchange(ref dirty, 1);
             }
-            try { await Task.Delay(Volatile.Read(ref browserFocused) != 0 ? Math.Max(16, 1000 / Volatile.Read(ref browserFrameRate)) : IdleCaptureIntervalMs, token); }
+            // The old path silently reduced output to ~30 FPS until the user
+            // clicked the browser. Keep the requested cadence on login screens too.
+            try { await Task.Delay(Math.Max(16, 1000 / Volatile.Read(ref browserFrameRate)), token); }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
         }
     }

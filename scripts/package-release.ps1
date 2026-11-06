@@ -139,10 +139,12 @@ try {
     }
 } finally { $archive.Dispose() }
 
-# Prepare the Dalamud custom repository metadata for a MANUAL commit and push.
-# This script never connects to GitHub, creates tags, or uploads anything.
+# Update the custom-repository JSON as plain text, preserving its existing
+# structure and avoiding PSCustomObject property-assignment behavior on PS 5.1.
+# This runs only after the release ZIP has been validated. No GitHub calls.
 $repoPath = Join-Path $root 'repo.json'
-[array]$repoEntries = @(Get-Content -LiteralPath $repoPath -Raw | ConvertFrom-Json)
+$repoText = [IO.File]::ReadAllText($repoPath, [Text.Encoding]::UTF8)
+$repoEntries = @((ConvertFrom-Json -InputObject $repoText))
 if ($repoEntries.Count -ne 1 -or [string]$repoEntries[0].InternalName -ne 'BryersHideoutGames') {
     throw 'Expected one BryersHideoutGames entry in repo.json.'
 }
@@ -152,25 +154,22 @@ foreach ($link in @('DownloadLinkInstall', 'DownloadLinkUpdate', 'DownloadLinkTe
         throw "Unexpected $link in repo.json: $uri"
     }
 }
-# Some manually maintained repo.json files omit these optional metadata fields.
-# In PowerShell with StrictMode Latest, assigning a missing PSCustomObject property
-# throws PropertyAssignmentException. Add missing fields instead of failing after
-# the Release ZIP has already been compiled and validated.
-$repoEntry = $repoEntries[0]
-$repoUpdates = @{
-    AssemblyVersion = $assembledVersion
-    LastUpdate = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$versionPattern = '("AssemblyVersion"\s*:\s*")[^"]*(")'
+if (-not [regex]::IsMatch($repoText, $versionPattern)) {
+    throw 'repo.json does not have an AssemblyVersion field.'
 }
-foreach ($field in $repoUpdates.Keys) {
-    $property = $repoEntry.PSObject.Properties[$field]
-    if ($null -eq $property) {
-        $repoEntry | Add-Member -MemberType NoteProperty -Name $field -Value $repoUpdates[$field]
-    } else {
-        $property.Value = $repoUpdates[$field]
-    }
+$repoText = [regex]::Replace($repoText, $versionPattern, ('${1}' + $assembledVersion + '${2}'))
+$lastUpdatePattern = '("LastUpdate"\s*:\s*)[0-9]+'
+$unixTime = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+if ([regex]::IsMatch($repoText, $lastUpdatePattern)) {
+    $repoText = [regex]::Replace($repoText, $lastUpdatePattern, ('${1}' + $unixTime))
+} else {
+    # repo.json may omit the optional LastUpdate property.
+    $repoObj = @((ConvertFrom-Json -InputObject $repoText))
+    $repoObj[0] | Add-Member -NotePropertyName LastUpdate -NotePropertyValue $unixTime -Force
+    $repoText = ConvertTo-Json -InputObject $repoObj -Depth 30
 }
-[IO.File]::WriteAllText($repoPath, (ConvertTo-Json -InputObject $repoEntries -Depth 30) + "`n", [Text.UTF8Encoding]::new($false))
-
+[IO.File]::WriteAllText($repoPath, $repoText.TrimEnd() + "`n", [Text.UTF8Encoding]::new($false))
 Write-Host "Validated installable Dalamud Release: $zipPath" -ForegroundColor Green
 Write-Host "Bundled Chromium: $runtimeName" -ForegroundColor Green
 Write-Host "Updated repo.json to $assembledVersion (commit this file manually)." -ForegroundColor Yellow

@@ -3,8 +3,8 @@
     "Author": "Latency Bryer",
     "Name": "Bryer's Hideout Games",
     "InternalName": "BryersHideoutGames",
-    "AssemblyVersion": "1.0.0.2",
-    "Description": "Play Bryer's Hideout minigames inside Final Fantasy XIV through Dalamud. Includes direct game windows, a compact launcher, access-code linking, and balance display.",
+    "AssemblyVersion": "1.0.0.3",
+    "Description": "Play Bryer's Hideout minigames inside Final Fantasy.",
     "ApplicableVersion": "any",
     "Tags": [
       "bryer",
@@ -26,6 +26,6 @@
     "DownloadLinkInstall": "https://github.com/LatencyBryer/Bryer-Hideout-Games/releases/latest/download/BryersHideoutGames-latest.zip",
     "DownloadLinkUpdate": "https://github.com/LatencyBryer/Bryer-Hideout-Games/releases/latest/download/BryersHideoutGames-latest.zip",
     "DownloadLinkTesting": "https://github.com/LatencyBryer/Bryer-Hideout-Games/releases/latest/download/BryersHideoutGames-latest.zip",
-    "LastUpdate": 0
+    "LastUpdate": 1793919121
   }
 ]
